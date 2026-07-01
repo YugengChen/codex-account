@@ -1,0 +1,1494 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
+AUTH_FILE="$CODEX_DIR/auth.json"
+ACCOUNTS_DIR="$CODEX_DIR/accounts"
+CURRENT_FILE="$ACCOUNTS_DIR/current"
+BACKUP_DIR="$ACCOUNTS_DIR/backups"
+LOCK_FILE="$ACCOUNTS_DIR/.lock"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  codex-account list [--no]
+  codex-account list --no-limits
+  codex-account current
+  codex-account save <name>
+  codex-account use <name>
+  codex-account change
+  codex-account add <name> [codex-login-options...]
+  codex-account rest <name> [--dry-run] [--idempotency-key KEY]
+  codex-account touch [--minimal|--strong|--chars N] [--verify|--no-verify] [--once|--until-stable] [--max-attempts N] [--verify-retries N] [--verify-delay S] <name>|all|--all
+  codex-account exec <name> -- <command...>
+  codex-account remove <name> [--force]
+
+Examples:
+  codex-account save work
+  codex-account add personal --device-auth
+  codex-account use work
+  codex-account change
+  codex-account rest work
+  codex-account rest work --dry-run
+  codex-account touch work
+  codex-account touch --minimal google
+  codex-account touch --once --chars 100000 google
+  codex-account touch --max-attempts 3 google
+  codex-account touch all
+  codex-account touch --all
+  codex-account exec personal -- codex
+  codex-account remove old-account
+  codex-account remove personal --force
+
+Notes:
+  Account names may contain only letters, digits, dot, underscore, and dash.
+  Saved accounts are stored under ~/.codex/accounts with 700/600 permissions.
+  list updates account information by reading live limits only; it never sends a model request.
+  list shows reset_left when rate limit reset credits are returned by Codex.
+  Use --no, --no-touch, or --no-limits for the quick saved-account list without reading limits.
+  change reads live limits, requires 5h_left >= 70%, then chooses highest week_left.
+  If week_left ties, change chooses the account whose week_reset is sooner.
+  rest consumes one official rate-limit reset credit for one saved account when a reset is eligible.
+  rest uses app-server only; it does not send a model request.
+  Reuse --idempotency-key KEY only when retrying the same reset attempt.
+  touch starts a background codex exec session, asks a simple 1+1 question, then waits for it to close.
+  By default, touch uses 100000 chars, verifies live limits, and repeats when the result is still probe.
+  Use touch --minimal for the old one-shot minimal request, or --chars N/CODEX_ACCOUNT_TOUCH_CHARS to tune input size.
+  Use --once or --max-attempts N to limit repeat touch attempts.
+  Touch can move the 5h reset window; touch model/effort default to config.toml.
+  Override touch with CODEX_ACCOUNT_TOUCH_MODEL, CODEX_ACCOUNT_TOUCH_EFFORT, CODEX_ACCOUNT_TOUCH_VERIFY, or CODEX_ACCOUNT_TOUCH_MAX_ATTEMPTS.
+  Removing the active account requires --force and clears the active Codex login.
+EOF
+}
+
+die() {
+  echo "codex-account: $*" >&2
+  exit 1
+}
+
+debug_log() {
+  [[ "${CODEX_ACCOUNT_DEBUG:-0}" == "0" || -z "${CODEX_ACCOUNT_DEBUG:-}" ]] && return 0
+  printf 'debug: %s\n' "$*" >&2
+}
+
+ensure_dirs() {
+  mkdir -p "$ACCOUNTS_DIR" "$BACKUP_DIR"
+  chmod 700 "$ACCOUNTS_DIR" "$BACKUP_DIR"
+}
+
+lock() {
+  ensure_dirs
+  exec 9>"$LOCK_FILE"
+  flock 9
+}
+
+validate_name() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "missing account name"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid account name: $name"
+}
+
+account_dir() {
+  printf '%s/%s\n' "$ACCOUNTS_DIR" "$1"
+}
+
+account_auth() {
+  printf '%s/%s/auth.json\n' "$ACCOUNTS_DIR" "$1"
+}
+
+require_auth() {
+  [[ -s "$AUTH_FILE" ]] || die "no active auth file at $AUTH_FILE; run 'codex login' first"
+}
+
+require_account() {
+  local name="$1"
+  [[ -s "$(account_auth "$name")" ]] || die "unknown account '$name'; run 'codex-account list'"
+}
+
+install_auth() {
+  local src="$1"
+  install -m 600 "$src" "$AUTH_FILE"
+}
+
+save_auth_as() {
+  local name="$1"
+  local dir
+  dir="$(account_dir "$name")"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  install -m 600 "$AUTH_FILE" "$dir/auth.json"
+}
+
+set_current() {
+  local name="$1"
+  printf '%s\n' "$name" > "$CURRENT_FILE"
+  chmod 600 "$CURRENT_FILE"
+}
+
+get_current() {
+  [[ -f "$CURRENT_FILE" ]] && sed -n '1p' "$CURRENT_FILE" || true
+}
+
+backup_active_auth() {
+  [[ -s "$AUTH_FILE" ]] || return 0
+  local ts backup
+  ts="$(date +%Y%m%d-%H%M%S)"
+  backup="$BACKUP_DIR/auth.$ts.json"
+  install -m 600 "$AUTH_FILE" "$backup"
+}
+
+cleanup_tmp_dir() {
+  local dir="$1" attempt
+  [[ -n "$dir" && -d "$dir" ]] || return 0
+  chmod -R u+rwX "$dir" 2>/dev/null || true
+  for attempt in 1 2 3; do
+    rm -rf "$dir" 2>/dev/null && return 0
+    sleep 0.2
+  done
+  rm -rf "$dir" 2>/dev/null || true
+}
+
+sync_current_account() {
+  local current
+  current="$(get_current)"
+  [[ -n "$current" ]] || return 0
+  [[ -s "$AUTH_FILE" ]] || return 0
+  [[ -d "$(account_dir "$current")" ]] || return 0
+  save_auth_as "$current"
+}
+
+mask_value() {
+  local value="$1"
+  local len="${#value}"
+  if (( len <= 10 )); then
+    printf '%s' "***"
+  else
+    printf '%s...%s' "${value:0:6}" "${value: -4}"
+  fi
+}
+
+summarize_auth() {
+  local file="$1"
+  if command -v jq >/dev/null 2>&1; then
+    local mode account_id has_key
+    mode="$(jq -r '.auth_mode // "unknown"' "$file" 2>/dev/null || printf 'unknown')"
+    account_id="$(jq -r '.tokens.account_id // empty' "$file" 2>/dev/null || true)"
+    has_key="$(jq -r 'if (.OPENAI_API_KEY // null) then "yes" else "no" end' "$file" 2>/dev/null || printf 'no')"
+    if [[ -n "$account_id" ]]; then
+      printf 'auth_mode=%s account_id=%s' "$mode" "$(mask_value "$account_id")"
+    elif [[ "$has_key" == "yes" ]]; then
+      printf 'auth_mode=%s api_key=yes' "$mode"
+    else
+      printf 'auth_mode=%s' "$mode"
+    fi
+  else
+    printf 'auth saved'
+  fi
+}
+
+decode_auth_metadata() {
+  local file="$1"
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '%s\n' '{}'
+    return 0
+  fi
+
+  local token payload json
+  token="$(jq -r '.tokens.id_token // empty' "$file" 2>/dev/null || true)"
+  if [[ "$token" != *.*.* ]]; then
+    printf '%s\n' '{}'
+    return 0
+  fi
+
+  payload="${token#*.}"
+  payload="${payload%%.*}"
+  payload="${payload//-/+}"
+  payload="${payload//_//}"
+  while (( ${#payload} % 4 != 0 )); do
+    payload="${payload}="
+  done
+
+  json="$(printf '%s' "$payload" | base64 -d 2>/dev/null || true)"
+  if [[ -z "$json" ]]; then
+    printf '%s\n' '{}'
+    return 0
+  fi
+
+  jq -c '
+    ."https://api.openai.com/auth" as $auth |
+    {
+      tokenPlanType: ($auth.chatgpt_plan_type // null),
+      subscriptionActiveUntil: ($auth.chatgpt_subscription_active_until // null),
+      subscriptionLastChecked: ($auth.chatgpt_subscription_last_checked // null)
+    }
+  ' <<<"$json" 2>/dev/null || printf '%s\n' '{}'
+}
+
+format_reset_epoch() {
+  local epoch="${1:-}"
+  if [[ -z "$epoch" || "$epoch" == "-" || "$epoch" == "null" ]]; then
+    printf '%s' "-"
+    return 0
+  fi
+
+  if date -d "@$epoch" "+%-m-%-d %H:%M" >/dev/null 2>&1; then
+    date -d "@$epoch" "+%-m-%-d %H:%M"
+  else
+    printf '%s' "$epoch"
+  fi
+}
+
+format_change_reset_epoch() {
+  local epoch="${1:-}"
+  if [[ "$epoch" == "9999999999" ]]; then
+    printf '%s' "-"
+  else
+    format_reset_epoch "$epoch"
+  fi
+}
+
+format_month_day() {
+  local value="${1:-}"
+  if [[ -z "$value" || "$value" == "null" ]]; then
+    printf '%s' "-"
+    return 0
+  fi
+
+  if date -d "$value" "+%-m-%-d" >/dev/null 2>&1; then
+    date -d "$value" "+%-m-%-d"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+date_is_past() {
+  local value="${1:-}" ts now
+  [[ -n "$value" && "$value" != "null" ]] || return 1
+  ts="$(date -d "$value" "+%s" 2>/dev/null || true)"
+  [[ -n "$ts" ]] || return 1
+  now="$(date "+%s")"
+  (( ts < now ))
+}
+
+account_display_name() {
+  local name="$1"
+  local status_json="$2"
+  local plan until token_plan expiry live_ok
+
+  plan="$(jq -r '.rateLimits.planType // .account.planType // .tokenPlanType // "unknown"' <<<"$status_json" 2>/dev/null || printf 'unknown')"
+  token_plan="$(jq -r '.tokenPlanType // empty' <<<"$status_json" 2>/dev/null || true)"
+  until="$(jq -r '.subscriptionActiveUntil // empty' <<<"$status_json" 2>/dev/null || true)"
+  live_ok="$(jq -r 'if (.rateLimits != null and (.rateLimitError // null) == null and (.accountError // null) == null) then "yes" else "no" end' <<<"$status_json" 2>/dev/null || printf 'no')"
+
+  if [[ "$plan" == "unknown" && -n "$token_plan" ]]; then
+    plan="$token_plan"
+  fi
+
+  case "$plan" in
+    plus)
+      if date_is_past "$until"; then
+        if [[ "$live_ok" == "yes" ]]; then
+          printf '%s(plus)' "$name"
+        else
+          printf '%s(plus已过期)' "$name"
+        fi
+      elif [[ -n "$until" && "$until" != "null" ]]; then
+        expiry="$(format_month_day "$until")"
+        printf '%s(plus till %s)' "$name" "$expiry"
+      else
+        printf '%s(plus)' "$name"
+      fi
+      ;;
+    pro|prolite|go|team|self_serve_business_usage_based|business|enterprise_cbp_usage_based|enterprise|edu)
+      printf '%s(%s)' "$name" "$plan"
+      ;;
+    *)
+      printf '%s(plus已过期)' "$name"
+      ;;
+  esac
+}
+
+query_account_status() {
+  local auth_path="$1"
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '%s\n' '{"error":"jq is required"}'
+    return 0
+  fi
+  if ! command -v codex >/dev/null 2>&1; then
+    printf '%s\n' '{"error":"codex command not found"}'
+    return 0
+  fi
+
+  local tmp_home limits_response token_metadata line rpc_in rpc_out rpc_pid deadline
+  tmp_home="$(mktemp -d "$ACCOUNTS_DIR/.rpc.XXXXXX")" || {
+    printf '%s\n' '{"error":"failed to create temporary CODEX_HOME"}'
+    return 0
+  }
+  chmod 700 "$tmp_home"
+  install -m 600 "$auth_path" "$tmp_home/auth.json"
+  if [[ -f "$CODEX_DIR/config.toml" ]]; then
+    install -m 600 "$CODEX_DIR/config.toml" "$tmp_home/config.toml"
+  fi
+
+  limits_response=""
+
+  coproc CODEX_RPC { env CODEX_HOME="$tmp_home" codex -s read-only -a untrusted app-server 2>"$tmp_home/stderr"; }
+  rpc_in="${CODEX_RPC[1]}"
+  rpc_out="${CODEX_RPC[0]}"
+  rpc_pid="$CODEX_RPC_PID"
+
+  printf '%s\n' '{"method":"initialize","id":1,"params":{"clientInfo":{"name":"codex-account","title":null,"version":"0"},"capabilities":{"experimentalApi":true}}}' >&"${rpc_in}" || true
+
+  deadline=$((SECONDS + 10))
+  while (( SECONDS < deadline )); do
+    if IFS= read -r -t 1 line <&"${rpc_out}"; then
+      if jq -e '(.id? == 1)' >/dev/null 2>&1 <<<"$line"; then
+        break
+      fi
+    fi
+  done
+
+  printf '%s\n' '{"method":"initialized"}' >&"${rpc_in}" || true
+  printf '%s\n' '{"method":"account/rateLimits/read","id":3}' >&"${rpc_in}" || true
+
+  deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    if IFS= read -r -t 1 line <&"${rpc_out}"; then
+      if jq -e '(.id? == 3)' >/dev/null 2>&1 <<<"$line"; then
+        limits_response="$line"
+        break
+      fi
+    fi
+  done
+
+  exec {rpc_in}>&- 2>/dev/null || true
+  kill "$rpc_pid" 2>/dev/null || true
+  wait "$rpc_pid" 2>/dev/null || true
+  exec {rpc_out}<&- 2>/dev/null || true
+
+  token_metadata="$(decode_auth_metadata "$tmp_home/auth.json")"
+  if [[ -s "$tmp_home/auth.json" ]]; then
+    install -m 600 "$tmp_home/auth.json" "$auth_path"
+  fi
+  cleanup_tmp_dir "$tmp_home"
+
+  [[ -n "$limits_response" ]] || limits_response='{}'
+  [[ -n "$token_metadata" ]] || token_metadata='{}'
+
+  jq -c -n --argjson limits "$limits_response" --argjson token "$token_metadata" '
+    {
+      account: null,
+      requiresOpenaiAuth: null,
+      rateLimits: ($limits.result.rateLimits // null),
+      rateLimitsByLimitId: ($limits.result.rateLimitsByLimitId // null),
+      rateLimitResetCredits: ($limits.result.rateLimitResetCredits // null),
+      tokenPlanType: ($token.tokenPlanType // null),
+      subscriptionActiveUntil: ($token.subscriptionActiveUntil // null),
+      subscriptionLastChecked: ($token.subscriptionLastChecked // null),
+      accountError: null,
+      rateLimitError: ($limits.error.message // null)
+    }
+  ' 2>/dev/null || printf '%s\n' '{"error":"failed to parse app-server response"}'
+}
+
+new_idempotency_key() {
+  local name="${1:-account}"
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    sed -n '1p' /proc/sys/kernel/random/uuid
+    return 0
+  fi
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen
+    return 0
+  fi
+  printf 'codex-account-%s-%s-%s%s\n' "$name" "$(date +%s)" "$RANDOM" "$RANDOM"
+}
+
+consume_reset_credit() {
+  local auth_path="$1"
+  local idempotency_key="$2"
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '%s\n' '{"resetError":"jq is required"}'
+    return 0
+  fi
+  if ! command -v codex >/dev/null 2>&1; then
+    printf '%s\n' '{"resetError":"codex command not found"}'
+    return 0
+  fi
+
+  local tmp_home consume_response limits_response token_metadata line rpc_in rpc_out rpc_pid deadline
+  tmp_home="$(mktemp -d "$ACCOUNTS_DIR/.rpc.XXXXXX")" || {
+    printf '%s\n' '{"resetError":"failed to create temporary CODEX_HOME"}'
+    return 0
+  }
+  chmod 700 "$tmp_home"
+  install -m 600 "$auth_path" "$tmp_home/auth.json"
+  if [[ -f "$CODEX_DIR/config.toml" ]]; then
+    install -m 600 "$CODEX_DIR/config.toml" "$tmp_home/config.toml"
+  fi
+
+  consume_response=""
+  limits_response=""
+
+  coproc CODEX_RPC { env CODEX_HOME="$tmp_home" codex -s read-only -a untrusted app-server 2>"$tmp_home/stderr"; }
+  rpc_in="${CODEX_RPC[1]}"
+  rpc_out="${CODEX_RPC[0]}"
+  rpc_pid="$CODEX_RPC_PID"
+
+  printf '%s\n' '{"method":"initialize","id":1,"params":{"clientInfo":{"name":"codex-account","title":null,"version":"0"},"capabilities":{"experimentalApi":true}}}' >&"${rpc_in}" || true
+
+  deadline=$((SECONDS + 10))
+  while (( SECONDS < deadline )); do
+    if IFS= read -r -t 1 line <&"${rpc_out}"; then
+      if jq -e '(.id? == 1)' >/dev/null 2>&1 <<<"$line"; then
+        break
+      fi
+    fi
+  done
+
+  printf '%s\n' '{"method":"initialized"}' >&"${rpc_in}" || true
+  jq -cn --arg key "$idempotency_key" '{method:"account/rateLimitResetCredit/consume",id:3,params:{idempotencyKey:$key}}' >&"${rpc_in}" || true
+
+  deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    if IFS= read -r -t 1 line <&"${rpc_out}"; then
+      if jq -e '(.id? == 3)' >/dev/null 2>&1 <<<"$line"; then
+        consume_response="$line"
+        break
+      fi
+    fi
+  done
+
+  printf '%s\n' '{"method":"account/rateLimits/read","id":4}' >&"${rpc_in}" || true
+  deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    if IFS= read -r -t 1 line <&"${rpc_out}"; then
+      if jq -e '(.id? == 4)' >/dev/null 2>&1 <<<"$line"; then
+        limits_response="$line"
+        break
+      fi
+    fi
+  done
+
+  exec {rpc_in}>&- 2>/dev/null || true
+  kill "$rpc_pid" 2>/dev/null || true
+  wait "$rpc_pid" 2>/dev/null || true
+  exec {rpc_out}<&- 2>/dev/null || true
+
+  token_metadata="$(decode_auth_metadata "$tmp_home/auth.json")"
+  if [[ -s "$tmp_home/auth.json" ]]; then
+    install -m 600 "$tmp_home/auth.json" "$auth_path"
+  fi
+  cleanup_tmp_dir "$tmp_home"
+
+  [[ -n "$consume_response" ]] || consume_response='{}'
+  [[ -n "$limits_response" ]] || limits_response='{}'
+  [[ -n "$token_metadata" ]] || token_metadata='{}'
+
+  jq -c -n --argjson consume "$consume_response" --argjson limits "$limits_response" --argjson token "$token_metadata" '
+    {
+      outcome: ($consume.result.outcome // null),
+      rateLimits: ($limits.result.rateLimits // null),
+      rateLimitsByLimitId: ($limits.result.rateLimitsByLimitId // null),
+      rateLimitResetCredits: ($limits.result.rateLimitResetCredits // null),
+      tokenPlanType: ($token.tokenPlanType // null),
+      subscriptionActiveUntil: ($token.subscriptionActiveUntil // null),
+      subscriptionLastChecked: ($token.subscriptionLastChecked // null),
+      accountError: null,
+      resetError: ($consume.error.message // null),
+      rateLimitError: ($limits.error.message // null)
+    }
+  ' 2>/dev/null || printf '%s\n' '{"resetError":"failed to parse app-server response"}'
+}
+
+touch_account_usage() {
+  local auth_path="$1"
+  local touch_chars="${2:-0}"
+  if ! command -v codex >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local tmp_home model effort effort_config timeout_s status prompt touch_pid reply_file
+  model="$(touch_model)"
+  effort="$(touch_effort)"
+  effort_config="model_reasoning_effort=\"$effort\""
+  timeout_s="${CODEX_ACCOUNT_TOUCH_TIMEOUT:-45}"
+  prompt="$(touch_prompt "$touch_chars")"
+
+  tmp_home="$(mktemp -d "$ACCOUNTS_DIR/.touch.XXXXXX")" || return 1
+  chmod 700 "$tmp_home"
+  install -m 600 "$auth_path" "$tmp_home/auth.json"
+  if [[ -f "$CODEX_DIR/config.toml" ]]; then
+    install -m 600 "$CODEX_DIR/config.toml" "$tmp_home/config.toml"
+  fi
+  reply_file="$tmp_home/reply.txt"
+
+  set +e
+  (
+    env CODEX_HOME="$tmp_home" timeout "$timeout_s" \
+      codex exec \
+        --ephemeral \
+        --ignore-rules \
+        --skip-git-repo-check \
+        -C /tmp \
+        -s read-only \
+        -m "$model" \
+        -c "$effort_config" \
+        --color never \
+        --output-last-message "$reply_file" \
+        "$prompt" \
+        >"$tmp_home/touch.out" 2>"$tmp_home/touch.err"
+  ) &
+  touch_pid=$!
+  wait "$touch_pid"
+  status=$?
+  if (( status == 0 )); then
+    if ! touch_reply_ok "$reply_file" "$tmp_home/touch.out"; then
+      status=1
+    fi
+  fi
+  set -e
+
+  if [[ -s "$tmp_home/auth.json" ]]; then
+    install -m 600 "$tmp_home/auth.json" "$auth_path"
+  fi
+
+  cleanup_tmp_dir "$tmp_home"
+  return "$status"
+}
+
+touch_reply_ok() {
+  local reply_file="$1"
+  local stdout_file="$2"
+
+  if [[ -s "$reply_file" ]] && grep -Eq '(^|[^0-9])2([^0-9]|$)' "$reply_file"; then
+    return 0
+  fi
+  if [[ -s "$stdout_file" ]] && grep -Eq '(^|[^0-9])2([^0-9]|$)' "$stdout_file"; then
+    return 0
+  fi
+  return 1
+}
+
+touch_prompt() {
+  local chars="${1:-0}"
+  if [[ "$chars" =~ ^[0-9]+$ ]] && (( chars > 0 )); then
+    local chunk body
+    chunk="anchor-token-input "
+    body=""
+    while (( ${#body} < chars )); do
+      body="${body}${chunk}"
+    done
+    body="${body:0:chars}"
+    printf '1+1等于几？只回答数字 2。\nIgnore this filler text except as input tokens:\n%s\n' "$body"
+    return 0
+  fi
+
+  printf '1+1等于几？只回答数字 2。'
+}
+
+touch_model() {
+  local model
+  if [[ -n "${CODEX_ACCOUNT_TOUCH_MODEL:-}" ]]; then
+    printf '%s\n' "$CODEX_ACCOUNT_TOUCH_MODEL"
+    return 0
+  fi
+
+  if [[ -f "$CODEX_DIR/config.toml" ]]; then
+    model="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CODEX_DIR/config.toml" | sed -n '1p')"
+    if [[ -n "$model" ]]; then
+      printf '%s\n' "$model"
+      return 0
+    fi
+  fi
+
+  printf '%s\n' "gpt-5.5"
+}
+
+touch_effort() {
+  local effort
+  if [[ -n "${CODEX_ACCOUNT_TOUCH_EFFORT:-}" ]]; then
+    printf '%s\n' "$CODEX_ACCOUNT_TOUCH_EFFORT"
+    return 0
+  fi
+
+  if [[ -f "$CODEX_DIR/config.toml" ]]; then
+    effort="$(sed -n 's/^[[:space:]]*model_reasoning_effort[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CODEX_DIR/config.toml" | sed -n '1p')"
+    if [[ -n "$effort" ]]; then
+      printf '%s\n' "$effort"
+      return 0
+    fi
+  fi
+
+  printf '%s\n' "low"
+}
+
+format_rate_limit_fields() {
+  local status_json="$1"
+  jq -r '
+    def active_plan($p):
+      ["plus","pro","prolite","go","team","self_serve_business_usage_based","business","enterprise_cbp_usage_based","enterprise","edu"] | index($p) != null;
+    def pct_left($w):
+      if $w == null then "-"
+      else (((100 - ($w.usedPercent // 0)) | if . < 0 then 0 else . end | floor | tostring) + "%")
+      end;
+    def reset_at($w):
+      if $w == null or $w.resetsAt == null then "-" else ($w.resetsAt | tostring) end;
+    def reset_credits:
+      .rateLimitResetCredits as $credits |
+      if $credits == null then "-"
+      elif ($credits.availableCount // null) != null then ($credits.availableCount | tostring)
+      else "-"
+      end;
+    def absval:
+      if . < 0 then -. else . end;
+    def near($a; $b; $max_delta):
+      ((($a // 0) - $b) | absval) <= $max_delta;
+    def primary_probe:
+      (.rateLimits.primary != null)
+      and ((.rateLimits.primary.usedPercent // 0) <= 1)
+      and near(.rateLimits.primary.resetsAt; ((now | floor) + 18000); 180);
+    def secondary_probe:
+      (.rateLimits.secondary != null)
+      and ((.rateLimits.secondary.usedPercent // 0) <= 0.1)
+      and near(.rateLimits.secondary.resetsAt; ((now | floor) + 604800); 180);
+    def probe_only:
+      primary_probe and secondary_probe;
+    def plan:
+      .rateLimits.planType // .account.planType // .tokenPlanType // (if .account.type == "apiKey" then "apiKey" else "unknown" end);
+    def err:
+      .rateLimitError // .accountError // .error // "";
+    def auth_err($e):
+      ($e | test("401|token_revoked|token_invalidated|invalidated oauth token|authentication token has been invalidated|refresh token|signing in again"; "i"));
+    plan as $plan |
+    (active_plan($plan)) as $active |
+    (err) as $err |
+    [
+      $plan,
+      (if ($err | length) > 0 then
+        (if auth_err($err) then "relogin" elif $active then "unavail" else "expired" end)
+       elif (.rateLimits.rateLimitReachedType // null) != null then "limited"
+       elif probe_only then "probe"
+       elif primary_probe then "probe5h"
+       elif $active then "ok"
+       else "expired"
+       end),
+      pct_left(.rateLimits.primary),
+      reset_at(.rateLimits.primary),
+      pct_left(.rateLimits.secondary),
+      reset_at(.rateLimits.secondary),
+      reset_credits,
+      (if ($err | length) > 0 then $err else (.rateLimits.rateLimitReachedType // "") end)
+    ] | @tsv
+  ' <<<"$status_json"
+}
+
+stable_limit_state() {
+  case "${1:-}" in
+    ok|limited)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+change_usable_state() {
+  case "${1:-}" in
+    ok|limited|probe|probe5h)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+change_candidate_fields() {
+  local status_json="$1"
+  jq -r '
+    def active_plan($p):
+      ["plus","pro","prolite","go","team","self_serve_business_usage_based","business","enterprise_cbp_usage_based","enterprise","edu"] | index($p) != null;
+    def pct_left_num($w):
+      if $w == null then -1
+      else ((100 - ($w.usedPercent // 0)) | if . < 0 then 0 elif . > 100 then 100 else . end | floor)
+      end;
+    def reset_at_num($w):
+      if $w == null or $w.resetsAt == null then 9999999999 else (($w.resetsAt | tonumber? // 9999999999) | floor) end;
+    def absval:
+      if . < 0 then -. else . end;
+    def near($a; $b; $max_delta):
+      ((($a // 0) - $b) | absval) <= $max_delta;
+    def primary_probe:
+      (.rateLimits.primary != null)
+      and ((.rateLimits.primary.usedPercent // 0) <= 1)
+      and near(.rateLimits.primary.resetsAt; ((now | floor) + 18000); 180);
+    def secondary_probe:
+      (.rateLimits.secondary != null)
+      and ((.rateLimits.secondary.usedPercent // 0) <= 0.1)
+      and near(.rateLimits.secondary.resetsAt; ((now | floor) + 604800); 180);
+    def probe_only:
+      primary_probe and secondary_probe;
+    def plan:
+      .rateLimits.planType // .account.planType // .tokenPlanType // (if .account.type == "apiKey" then "apiKey" else "unknown" end);
+    def err:
+      .rateLimitError // .accountError // .error // "";
+    def auth_err($e):
+      ($e | test("401|token_revoked|token_invalidated|invalidated oauth token|authentication token has been invalidated|refresh token|signing in again"; "i"));
+    plan as $plan |
+    (active_plan($plan)) as $active |
+    (err) as $err |
+    [
+      (if ($err | length) > 0 then
+        (if auth_err($err) then "relogin" elif $active then "unavail" else "expired" end)
+       elif (.rateLimits.rateLimitReachedType // null) != null then "limited"
+       elif probe_only then "probe"
+       elif primary_probe then "probe5h"
+       elif $active then "ok"
+       else "expired"
+       end),
+      pct_left_num(.rateLimits.primary),
+      pct_left_num(.rateLimits.secondary),
+      reset_at_num(.rateLimits.secondary),
+      (if ($err | length) > 0 then $err else (.rateLimits.rateLimitReachedType // "") end)
+    ] | @tsv
+  ' <<<"$status_json"
+}
+
+cmd_list() {
+  local show_limits=1
+  while (($# > 0)); do
+    case "$1" in
+      --no|--no-touch|--no-limits)
+        show_limits=0
+        ;;
+      *)
+        die "usage: codex-account list [--no|--no-touch|--no-limits]"
+        ;;
+    esac
+    shift
+  done
+
+  lock
+  local current found name auth marker probe_seen=0
+  current="$(get_current)"
+  found=0
+
+  shopt -s nullglob
+  for auth in "$ACCOUNTS_DIR"/*/auth.json; do
+    if (( show_limits && found == 0 )); then
+      printf '%s %-34s %-9s %-8s %-11s %-10s %-11s %-10s\n' " " "account(plan)" "status" "5h_left" "5h_reset" "week_left" "week_reset" "reset_left"
+    fi
+    found=1
+    name="$(basename "$(dirname "$auth")")"
+    marker=" "
+    [[ "$name" == "$current" ]] && marker="*"
+    if (( show_limits )); then
+      local status_json display_name plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note five_reset week_reset
+      debug_log "$name limits=read"
+      status_json="$(query_account_status "$auth")"
+      if [[ "$name" == "$current" && -s "$auth" ]]; then
+        install_auth "$auth"
+      fi
+      IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+      reset_left="${reset_left:--}"
+      [[ "$state" == "probe" || "$state" == "probe5h" ]] && probe_seen=1
+      if [[ "$state" == "probe" ]]; then
+        five_left="~100%"
+        five_reset_epoch="-"
+        week_left="~100%"
+        week_reset_epoch="-"
+      elif [[ "$state" == "probe5h" ]]; then
+        five_left="~100%"
+        five_reset_epoch="-"
+      fi
+      five_reset="$(format_reset_epoch "$five_reset_epoch")"
+      week_reset="$(format_reset_epoch "$week_reset_epoch")"
+      display_name="$(account_display_name "$name" "$status_json")"
+      printf '%s %-34s %-9s %-8s %-11s %-10s %-11s %-10s\n' "$marker" "$display_name" "$state" "$five_left" "$five_reset" "$week_left" "$week_reset" "$reset_left"
+    else
+      local metadata_json display_name
+      metadata_json="$(decode_auth_metadata "$auth")"
+      display_name="$(account_display_name "$name" "$metadata_json")"
+      printf '%s %s\n' "$marker" "$display_name"
+    fi
+  done
+  shopt -u nullglob
+  (( found )) || echo "No saved accounts. Use: codex-account save <name>"
+  if (( probe_seen )); then
+    echo "note: status=probe/probe5h means the server did not return a stable 5h usage window; query-induced reset times are hidden."
+  fi
+}
+
+cmd_current() {
+  lock
+  local current
+  current="$(get_current)"
+  if [[ -n "$current" ]]; then
+    echo "Current marker: $current"
+  else
+    echo "Current marker: (not set)"
+  fi
+  if [[ -s "$AUTH_FILE" ]]; then
+    printf 'Active auth: '
+    summarize_auth "$AUTH_FILE"
+    printf '\n'
+  else
+    echo "Active auth: missing"
+  fi
+}
+
+cmd_save() {
+  local name="$1"
+  validate_name "$name"
+  lock
+  require_auth
+  save_auth_as "$name"
+  set_current "$name"
+  echo "Saved active Codex login as '$name'."
+}
+
+cmd_use() {
+  local name="$1"
+  validate_name "$name"
+  lock
+  switch_account_locked "$name"
+  echo "Switched Codex account to '$name'."
+}
+
+switch_account_locked() {
+  local name="$1"
+  require_account "$name"
+  sync_current_account
+  backup_active_auth
+  install_auth "$(account_auth "$name")"
+  set_current "$name"
+}
+
+cmd_change() {
+  (($# == 0)) || die "change takes no arguments"
+
+  lock
+  local current found=0 eligible=0 name auth status_json state five_left week_left week_reset note
+  local best_name="" best_state="" best_five_left=-1 best_week_left=-1 best_week_reset=9999999999
+  current="$(get_current)"
+
+  shopt -s nullglob
+  for auth in "$ACCOUNTS_DIR"/*/auth.json; do
+    found=1
+    name="$(basename "$(dirname "$auth")")"
+    debug_log "$name limits=read"
+    status_json="$(query_account_status "$auth")"
+    if [[ "$name" == "$current" && -s "$auth" ]]; then
+      install_auth "$auth"
+    fi
+    IFS=$'\t' read -r state five_left week_left week_reset note < <(change_candidate_fields "$status_json")
+    five_left="${five_left:--1}"
+    week_left="${week_left:--1}"
+    week_reset="${week_reset:-9999999999}"
+
+    case "$state" in
+      probe)
+        # A probe-only account has not exposed anchored 5h/week windows yet.
+        # Treat it like the list view does: usable, but with hidden reset times.
+        five_left=100
+        week_left=100
+        week_reset=9999999999
+        ;;
+      probe5h)
+        # The 5h window is query-induced/unstable, but usage is effectively empty.
+        five_left=100
+        ;;
+    esac
+
+    if change_usable_state "$state" && (( five_left >= 70 && week_left >= 0 )); then
+      eligible=1
+      if (( week_left > best_week_left )) \
+        || (( week_left == best_week_left && week_reset < best_week_reset )) \
+        || (( week_left == best_week_left && week_reset == best_week_reset && five_left > best_five_left )) \
+        || [[ "$name" == "$current" && "$best_name" != "$current" && "$week_left" == "$best_week_left" && "$week_reset" == "$best_week_reset" && "$five_left" == "$best_five_left" ]]; then
+        best_name="$name"
+        best_state="$state"
+        best_five_left="$five_left"
+        best_week_left="$week_left"
+        best_week_reset="$week_reset"
+      fi
+    fi
+  done
+  shopt -u nullglob
+
+  (( found )) || die "no saved accounts; use: codex-account save <name>"
+  (( eligible )) || die "no saved account has usable 5h_left >= 70% and readable week_left"
+
+  if [[ "$best_name" == "$current" ]]; then
+    install_auth "$(account_auth "$best_name")"
+    printf "Already using best Codex account '%s' (status=%s 5h_left=%s%% week_left=%s%% week_reset=%s).\n" \
+      "$best_name" "$best_state" "$best_five_left" "$best_week_left" "$(format_change_reset_epoch "$best_week_reset")"
+    return 0
+  fi
+
+  switch_account_locked "$best_name"
+  printf "Switched Codex account to '%s' (status=%s 5h_left=%s%% week_left=%s%% week_reset=%s).\n" \
+    "$best_name" "$best_state" "$best_five_left" "$best_week_left" "$(format_change_reset_epoch "$best_week_reset")"
+}
+
+cmd_rest() {
+  local name="" dry_run=0 idempotency_key=""
+
+  while (($# > 0)); do
+    case "$1" in
+      --dry-run)
+        dry_run=1
+        ;;
+      --idempotency-key)
+        shift
+        [[ -n "${1:-}" ]] || die "usage: codex-account rest <name> [--dry-run] [--idempotency-key KEY]"
+        idempotency_key="$1"
+        ;;
+      --idempotency-key=*)
+        idempotency_key="${1#--idempotency-key=}"
+        ;;
+      -*)
+        die "unknown rest option: $1"
+        ;;
+      *)
+        [[ -z "$name" ]] || die "rest accepts exactly one account name"
+        name="$1"
+        ;;
+    esac
+    shift
+  done
+
+  validate_name "$name"
+  if [[ -n "$idempotency_key" && "$idempotency_key" =~ [[:space:]] ]]; then
+    die "idempotency key must not contain whitespace"
+  fi
+
+  lock
+  require_account "$name"
+
+  local current auth status_json plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note five_reset week_reset
+  current="$(get_current)"
+  auth="$(account_auth "$name")"
+
+  if (( dry_run )); then
+    status_json="$(query_account_status "$auth")"
+    if [[ "$name" == "$current" && -s "$auth" ]]; then
+      install_auth "$auth"
+    fi
+    IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+    reset_left="${reset_left:--}"
+    five_reset="$(format_reset_epoch "$five_reset_epoch")"
+    week_reset="$(format_reset_epoch "$week_reset_epoch")"
+    printf "%s reset dry-run; status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
+      "$name" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+    return 0
+  fi
+
+  [[ -n "$idempotency_key" ]] || idempotency_key="$(new_idempotency_key "$name")"
+
+  local result_json reset_error outcome rate_limit_error status=0
+  result_json="$(consume_reset_credit "$auth" "$idempotency_key")"
+  if [[ "$name" == "$current" && -s "$auth" ]]; then
+    install_auth "$auth"
+  fi
+
+  reset_error="$(jq -r '.resetError // empty' <<<"$result_json" 2>/dev/null || true)"
+  if [[ -n "$reset_error" ]]; then
+    die "reset failed for '$name': $reset_error"
+  fi
+
+  outcome="$(jq -r '.outcome // empty' <<<"$result_json" 2>/dev/null || true)"
+  [[ -n "$outcome" ]] || die "reset failed for '$name': no consume response"
+
+  IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$result_json")
+  reset_left="${reset_left:--}"
+  five_reset="$(format_reset_epoch "$five_reset_epoch")"
+  week_reset="$(format_reset_epoch "$week_reset_epoch")"
+  rate_limit_error="$(jq -r '.rateLimitError // empty' <<<"$result_json" 2>/dev/null || true)"
+
+  case "$outcome" in
+    reset)
+      printf "%s reset credit consumed; status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+      ;;
+    alreadyRedeemed)
+      printf "%s reset already redeemed for this idempotency key; status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+      ;;
+    nothingToReset)
+      printf "%s reset not used; outcome=nothingToReset status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+      status=1
+      ;;
+    noCredit)
+      printf "%s reset not used; outcome=noCredit status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+      status=1
+      ;;
+    *)
+      printf "%s reset finished with unknown outcome=%s; status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
+        "$name" "$outcome" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+      status=1
+      ;;
+  esac
+
+  if [[ -n "$rate_limit_error" ]]; then
+    printf "note: limits refresh after reset returned: %s\n" "$rate_limit_error" >&2
+  fi
+  return "$status"
+}
+
+cmd_add() {
+  local name="$1"
+  shift || true
+  validate_name "$name"
+  lock
+
+  local previous_current previous_auth_tmp had_previous=0
+  previous_current="$(get_current)"
+  previous_auth_tmp="$(mktemp "$ACCOUNTS_DIR/.previous-auth.XXXXXX")"
+  chmod 600 "$previous_auth_tmp"
+
+  if [[ -s "$AUTH_FILE" ]]; then
+    sync_current_account
+    install -m 600 "$AUTH_FILE" "$previous_auth_tmp"
+    had_previous=1
+    rm -f "$AUTH_FILE"
+  fi
+
+  echo "Starting 'codex login' for account '$name'..."
+  set +e
+  codex login "$@"
+  local status=$?
+  set -e
+
+  if (( status != 0 )); then
+    [[ "$had_previous" == 1 ]] && install_auth "$previous_auth_tmp"
+    [[ -n "$previous_current" ]] && set_current "$previous_current"
+    rm -f "$previous_auth_tmp"
+    die "codex login failed; previous login was restored"
+  fi
+
+  if [[ ! -s "$AUTH_FILE" ]]; then
+    [[ "$had_previous" == 1 ]] && install_auth "$previous_auth_tmp"
+    [[ -n "$previous_current" ]] && set_current "$previous_current"
+    rm -f "$previous_auth_tmp"
+    die "codex login finished but did not create $AUTH_FILE; previous login was restored"
+  fi
+
+  save_auth_as "$name"
+  set_current "$name"
+  rm -f "$previous_auth_tmp"
+  echo "Added and switched to Codex account '$name'."
+}
+
+verify_touched_account() {
+  local name="$1"
+  local auth="$2"
+  local current="$3"
+  local retries="$4"
+  local delay_s="$5"
+  local model="$6"
+  local effort="$7"
+  local touch_chars="$8"
+  local attempt status_json plan state five_left five_reset_epoch week_left week_reset_epoch note five_reset week_reset
+
+  state="unavail"
+  five_left="-"
+  five_reset_epoch="-"
+  week_left="-"
+  week_reset_epoch="-"
+
+  for (( attempt = 1; attempt <= retries; attempt++ )); do
+    status_json="$(query_account_status "$auth")"
+    if [[ "$name" == "$current" && -s "$auth" ]]; then
+      install_auth "$auth"
+    fi
+    IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch note < <(format_rate_limit_fields "$status_json")
+    state="${state:-unavail}"
+    five_left="${five_left:--}"
+    five_reset_epoch="${five_reset_epoch:--}"
+    week_left="${week_left:--}"
+    week_reset_epoch="${week_reset_epoch:--}"
+
+    stable_limit_state "$state" && break
+    if (( attempt < retries )); then
+      sleep "$delay_s"
+    fi
+  done
+
+  if [[ "$state" == "probe" ]]; then
+    five_left="~100%"
+    five_reset_epoch="-"
+    week_left="~100%"
+    week_reset_epoch="-"
+  elif [[ "$state" == "probe5h" ]]; then
+    five_left="~100%"
+    five_reset_epoch="-"
+  fi
+  five_reset="$(format_reset_epoch "$five_reset_epoch")"
+  week_reset="$(format_reset_epoch "$week_reset_epoch")"
+
+  if stable_limit_state "$state"; then
+    printf '%s touch verified; model=%s effort=%s chars=%s status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s\n' \
+      "$name" "$model" "$effort" "$touch_chars" "$state" "$five_left" "$five_reset" "$week_left" "$week_reset"
+    return 0
+  fi
+
+  printf '%s touch unverified; model=%s effort=%s chars=%s status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s\n' \
+    "$name" "$model" "$effort" "$touch_chars" "$state" "$five_left" "$five_reset" "$week_left" "$week_reset"
+  if [[ "$state" == "probe" || "$state" == "probe5h" ]]; then
+    return 2
+  fi
+  return 1
+}
+
+touch_saved_account() {
+  local name="$1"
+  local current="$2"
+  local touch_chars="${3:-0}"
+  local verify="${4:-0}"
+  local verify_retries="${5:-1}"
+  local verify_delay="${6:-5}"
+  local until_stable="${7:-0}"
+  local max_attempts="${8:-0}"
+  local auth reset_epoch model effort attempt verify_status
+
+  auth="$(account_auth "$name")"
+  model="$(touch_model)"
+  effort="$(touch_effort)"
+  attempt=1
+
+  while :; do
+    debug_log "$name touch=run attempt=$attempt model=$model effort=$effort chars=$touch_chars"
+    if ! touch_account_usage "$auth" "$touch_chars"; then
+      printf '%s touch failed; attempt=%s\n' "$name" "$attempt" >&2
+      return 1
+    fi
+
+    debug_log "$name touch=ok attempt=$attempt"
+    if [[ "$name" == "$current" && -s "$auth" ]]; then
+      install_auth "$auth"
+    fi
+
+    if (( verify )); then
+      set +e
+      verify_touched_account "$name" "$auth" "$current" "$verify_retries" "$verify_delay" "$model" "$effort" "$touch_chars"
+      verify_status=$?
+      set -e
+      if (( verify_status == 0 )); then
+        return 0
+      fi
+      if (( ! until_stable || verify_status != 2 )); then
+        return "$verify_status"
+      fi
+      if (( max_attempts > 0 && attempt >= max_attempts )); then
+        printf '%s touch stopped; reached max_attempts=%s while 5h window was still unstable\n' "$name" "$max_attempts" >&2
+        return "$verify_status"
+      fi
+      attempt=$((attempt + 1))
+      printf '%s touch retrying; 5h window still unstable attempt=%s chars=%s\n' "$name" "$attempt" "$touch_chars" >&2
+      continue
+    fi
+
+    reset_epoch=$(( $(date +%s) + 300 * 60 ))
+    printf '%s touch request sent; model=%s effort=%s chars=%s target_5h_reset_approx=%s\n' "$name" "$model" "$effort" "$touch_chars" "$(format_reset_epoch "$reset_epoch")"
+    return 0
+  done
+}
+
+touch_note() {
+  echo "note: target_5h_reset_approx is local and not confirmation that the server primary limit was anchored; 'codex-account list' queries live server limits."
+}
+
+cmd_touch() {
+  local target="" touch_chars verify verify_retries verify_delay until_stable max_attempts
+  touch_chars="${CODEX_ACCOUNT_TOUCH_CHARS:-${CODEX_ACCOUNT_TOUCH_STRONG_CHARS:-100000}}"
+  case "${CODEX_ACCOUNT_TOUCH_VERIFY:-1}" in
+    0|false|FALSE|no|NO|off|OFF)
+      verify=0
+      ;;
+    *)
+      verify=1
+      ;;
+  esac
+  case "${CODEX_ACCOUNT_TOUCH_UNTIL_STABLE:-1}" in
+    0|false|FALSE|no|NO|off|OFF)
+      until_stable=0
+      ;;
+    *)
+      until_stable=1
+      ;;
+  esac
+  verify_retries="${CODEX_ACCOUNT_TOUCH_VERIFY_RETRIES:-1}"
+  verify_delay="${CODEX_ACCOUNT_TOUCH_VERIFY_DELAY:-5}"
+  max_attempts="${CODEX_ACCOUNT_TOUCH_MAX_ATTEMPTS:-0}"
+
+  while (($# > 0)); do
+    case "$1" in
+      --strong)
+        touch_chars="${CODEX_ACCOUNT_TOUCH_STRONG_CHARS:-100000}"
+        ;;
+      --minimal)
+        touch_chars=0
+        verify=0
+        until_stable=0
+        ;;
+      --chars)
+        shift
+        [[ -n "${1:-}" ]] || die "usage: codex-account touch --chars N <name>|all|--all"
+        touch_chars="$1"
+        ;;
+      --chars=*)
+        touch_chars="${1#--chars=}"
+        ;;
+      --verify)
+        verify=1
+        ;;
+      --no-verify)
+        verify=0
+        until_stable=0
+        ;;
+      --until-stable)
+        verify=1
+        until_stable=1
+        ;;
+      --once)
+        until_stable=0
+        ;;
+      --max-attempts)
+        shift
+        [[ -n "${1:-}" ]] || die "usage: codex-account touch --max-attempts N <name>|all|--all"
+        verify=1
+        until_stable=1
+        max_attempts="$1"
+        ;;
+      --max-attempts=*)
+        verify=1
+        until_stable=1
+        max_attempts="${1#--max-attempts=}"
+        ;;
+      --verify-retries)
+        shift
+        [[ -n "${1:-}" ]] || die "usage: codex-account touch --verify-retries N <name>|all|--all"
+        verify=1
+        verify_retries="$1"
+        ;;
+      --verify-retries=*)
+        verify=1
+        verify_retries="${1#--verify-retries=}"
+        ;;
+      --verify-delay)
+        shift
+        [[ -n "${1:-}" ]] || die "usage: codex-account touch --verify-delay S <name>|all|--all"
+        verify=1
+        verify_delay="$1"
+        ;;
+      --verify-delay=*)
+        verify=1
+        verify_delay="${1#--verify-delay=}"
+        ;;
+      -*)
+        die "unknown touch option: $1"
+        ;;
+      *)
+        [[ -z "$target" ]] || die "touch accepts exactly one account target"
+        target="$1"
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$target" ]] || die "usage: codex-account touch [--minimal|--strong|--chars N] [--verify|--no-verify] [--once|--until-stable] [--max-attempts N] [--verify-retries N] [--verify-delay S] <name>|all|--all"
+  [[ "$touch_chars" =~ ^[0-9]+$ ]] || die "touch chars must be a non-negative integer"
+  [[ "$verify_retries" =~ ^[0-9]+$ && "$verify_retries" -ge 1 ]] || die "touch verify retries must be a positive integer"
+  [[ "$verify_delay" =~ ^[0-9]+$ ]] || die "touch verify delay must be a non-negative integer"
+  [[ "$max_attempts" =~ ^[0-9]+$ ]] || die "touch max attempts must be a non-negative integer"
+
+  lock
+  local current failed=0 found=0 name auth
+  current="$(get_current)"
+
+  if [[ "$target" == "all" || "$target" == "--all" ]]; then
+    shopt -s nullglob
+    for auth in "$ACCOUNTS_DIR"/*/auth.json; do
+      found=1
+      name="$(basename "$(dirname "$auth")")"
+      touch_saved_account "$name" "$current" "$touch_chars" "$verify" "$verify_retries" "$verify_delay" "$until_stable" "$max_attempts" || failed=1
+    done
+    shopt -u nullglob
+    (( found )) || echo "No saved accounts. Use: codex-account save <name>"
+    if (( found && ! verify )); then
+      touch_note
+    fi
+    return "$failed"
+  fi
+
+  validate_name "$target"
+  require_account "$target"
+  set +e
+  touch_saved_account "$target" "$current" "$touch_chars" "$verify" "$verify_retries" "$verify_delay" "$until_stable" "$max_attempts"
+  local status=$?
+  set -e
+  if (( ! verify )); then
+    touch_note
+  fi
+  return "$status"
+}
+
+cmd_exec() {
+  local name="$1"
+  shift || true
+  validate_name "$name"
+  [[ "${1:-}" == "--" ]] || die "usage: codex-account exec <name> -- <command...>"
+  shift
+  (($# > 0)) || die "missing command after --"
+
+  lock
+  require_account "$name"
+
+  local previous_current previous_auth_tmp had_previous=0
+  previous_current="$(get_current)"
+  previous_auth_tmp="$(mktemp "$ACCOUNTS_DIR/.exec-previous-auth.XXXXXX")"
+  chmod 600 "$previous_auth_tmp"
+
+  if [[ -s "$AUTH_FILE" ]]; then
+    sync_current_account
+    install -m 600 "$AUTH_FILE" "$previous_auth_tmp"
+    had_previous=1
+  fi
+
+  install_auth "$(account_auth "$name")"
+  set_current "$name"
+
+  set +e
+  "$@"
+  local status=$?
+  set -e
+
+  if [[ -s "$AUTH_FILE" ]]; then
+    save_auth_as "$name"
+  fi
+
+  if [[ "$had_previous" == 1 ]]; then
+    install_auth "$previous_auth_tmp"
+    if [[ -n "$previous_current" ]]; then
+      set_current "$previous_current"
+    else
+      rm -f "$CURRENT_FILE"
+    fi
+  else
+    rm -f "$AUTH_FILE" "$CURRENT_FILE"
+  fi
+  rm -f "$previous_auth_tmp"
+
+  return "$status"
+}
+
+cmd_remove() {
+  local name="" force=0
+
+  while (($# > 0)); do
+    case "$1" in
+      --force|-f)
+        force=1
+        ;;
+      -*)
+        die "unknown remove option: $1"
+        ;;
+      *)
+        [[ -z "$name" ]] || die "remove accepts exactly one account name"
+        name="$1"
+        ;;
+    esac
+    shift
+  done
+
+  validate_name "$name"
+  lock
+  require_account "$name"
+  local current
+  current="$(get_current)"
+  if [[ "$name" == "$current" ]]; then
+    if (( ! force )); then
+      die "refusing to remove active account '$name'; switch first or use --force"
+    fi
+    backup_active_auth
+    rm -rf "$(account_dir "$name")"
+    rm -f "$AUTH_FILE" "$CURRENT_FILE"
+    echo "Removed active Codex account '$name' and cleared active login."
+    return 0
+  fi
+
+  rm -rf "$(account_dir "$name")"
+  echo "Removed saved Codex account '$name'."
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    list|ls)
+      shift
+      cmd_list "$@"
+      ;;
+    current|status|whoami)
+      shift
+      (($# == 0)) || die "current takes no arguments"
+      cmd_current
+      ;;
+    save)
+      shift
+      (($# == 1)) || die "usage: codex-account save <name>"
+      cmd_save "$1"
+      ;;
+    use|switch)
+      shift
+      (($# == 1)) || die "usage: codex-account use <name>"
+      cmd_use "$1"
+      ;;
+    change)
+      shift
+      cmd_change "$@"
+      ;;
+    rest|reset|rate-reset)
+      shift
+      (($# >= 1)) || die "usage: codex-account rest <name> [--dry-run] [--idempotency-key KEY]"
+      cmd_rest "$@"
+      ;;
+    add|login)
+      shift
+      (($# >= 1)) || die "usage: codex-account add <name> [codex-login-options...]"
+      local name="$1"
+      shift
+      cmd_add "$name" "$@"
+      ;;
+    touch)
+      shift
+      (($# >= 1)) || die "usage: codex-account touch [--minimal|--strong|--chars N] [--verify|--no-verify] [--once|--until-stable] [--max-attempts N] [--verify-retries N] [--verify-delay S] <name>|all|--all"
+      cmd_touch "$@"
+      ;;
+    exec|run)
+      shift
+      (($# >= 3)) || die "usage: codex-account exec <name> -- <command...>"
+      local name="$1"
+      shift
+      cmd_exec "$name" "$@"
+      ;;
+    remove|rm|delete)
+      shift
+      (($# >= 1)) || die "usage: codex-account remove <name> [--force]"
+      cmd_remove "$@"
+      ;;
+    help|-h|--help|"")
+      usage
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

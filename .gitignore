@@ -1,0 +1,45 @@
+# Codex auth and local runtime state
+.codex/
+.codex.bak/
+auth.json
+**/auth.json
+accounts/
+**/accounts/
+backups/
+**/backups/
+
+# Temporary CODEX_HOME directories created by this tool or inspections
+.rpc.*
+.touch.*
+.inspect.*
+.previous-auth.*
+.exec-previous-auth.*
+**/.rpc.*
+**/.touch.*
+**/.inspect.*
+**/.previous-auth.*
+**/.exec-previous-auth.*
+
+# Local secrets and environment
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Runtime artifacts
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+models_cache.json
+installation_id
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
