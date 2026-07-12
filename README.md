@@ -40,6 +40,9 @@ codex-account save work
 codex-account use work
 codex-account change
 codex-account add personal --device-auth
+codex-account list
+codex-account touch all
+codex-account rest work --dry-run
 codex-account exec personal -- codex
 codex-account remove old-account
 ```
@@ -63,7 +66,26 @@ $CODEX_HOME/
     backups/
     account-name/
       auth.json
+      reset.json
+      touch.json
 ```
+
+`reset.json` stores local reset-credit metadata. `touch.json` stores only the
+verified weekly reset epoch and verification time; it does not contain auth
+tokens or account identifiers.
+
+## Weekly Limit Windows
+
+Current Codex responses can expose a weekly `10080`-minute window as
+`rateLimits.primary` with no secondary window. The utility identifies windows
+by `windowDurationMins` rather than assuming `primary` is always a 5-hour
+window.
+
+`touch all` checks every saved account and skips windows whose reset epoch is
+already verified. For an unanchored weekly window, it sends a real Codex
+request and compares repeated live `week_reset` values. Three consecutive
+identical reset epochs are recorded as an anchored window. By default it keeps
+retrying unstable windows; use `--once` or `--max-attempts N` to bound usage.
 
 Account names may contain only letters, digits, dots, underscores, and dashes.
 
@@ -71,10 +93,13 @@ Account names may contain only letters, digits, dots, underscores, and dashes.
 
 - Do not commit `auth.json`, `$CODEX_HOME`, `$CODEX_HOME/accounts`, backups, or
   temporary runtime directories.
+- Never paste command output containing tokens, raw `auth.json` content, or
+  private account identifiers into issues, commits, or pull requests.
 - `list` reads live rate limits through `codex app-server`; it does not send a
   model request.
 - `touch` intentionally sends a real `codex exec` request and can consume model
-  usage.
+  usage. Its default strong prompt is 100,000 characters and retries can consume
+  substantial weekly allowance.
 - `rest` consumes an official rate-limit reset credit when a reset is eligible.
 - The script uses `flock` around account-state changes to avoid concurrent
   writes.

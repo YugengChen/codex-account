@@ -3,6 +3,8 @@
 .codex.bak/
 auth.json
 **/auth.json
+**/reset.json
+**/touch.json
 accounts/
 **/accounts/
 backups/

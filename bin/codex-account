@@ -44,18 +44,22 @@ Notes:
   Account names may contain only letters, digits, dot, underscore, and dash.
   Saved accounts are stored under ~/.codex/accounts with 700/600 permissions.
   list updates account information by reading live limits only; it never sends a model request.
+  list identifies rate-limit windows by windowDurationMins instead of assuming primary=5h and secondary=week.
   list shows reset_left when rate limit reset credits are returned by Codex.
+  list reads reset-credit details from ChatGPT and shows the nearest reset_exp inside reset_left when returned.
   Use --no, --no-touch, or --no-limits for the quick saved-account list without reading limits.
-  change reads live limits, requires 5h_left >= 70%, then chooses highest week_left.
+  change reads live limits and chooses the account with the highest week_left.
   If week_left ties, change chooses the account whose week_reset is sooner.
   rest consumes one official rate-limit reset credit for one saved account when a reset is eligible.
   rest uses app-server only; it does not send a model request.
   Reuse --idempotency-key KEY only when retrying the same reset attempt.
-  touch starts a background codex exec session, asks a simple 1+1 question, then waits for it to close.
+  touch anchors weekly-only limits by sending usage, then verifies that week_reset stays fixed across live reads.
+  Accounts with an already verified weekly window are skipped without sending another model request.
+  On legacy accounts with a 5h window, touch also starts a background codex exec session and asks a simple 1+1 question.
   By default, touch uses 100000 chars, verifies live limits, and repeats when the result is still probe.
   Use touch --minimal for the old one-shot minimal request, or --chars N/CODEX_ACCOUNT_TOUCH_CHARS to tune input size.
   Use --once or --max-attempts N to limit repeat touch attempts.
-  Touch can move the 5h reset window; touch model/effort default to config.toml.
+  Touch can move the weekly or legacy 5h reset window; touch model/effort default to config.toml.
   Override touch with CODEX_ACCOUNT_TOUCH_MODEL, CODEX_ACCOUNT_TOUCH_EFFORT, CODEX_ACCOUNT_TOUCH_VERIFY, or CODEX_ACCOUNT_TOUCH_MAX_ATTEMPTS.
   Removing the active account requires --force and clears the active Codex login.
 EOF
@@ -94,6 +98,14 @@ account_dir() {
 
 account_auth() {
   printf '%s/%s/auth.json\n' "$ACCOUNTS_DIR" "$1"
+}
+
+account_reset_metadata() {
+  printf '%s/%s/reset.json\n' "$ACCOUNTS_DIR" "$1"
+}
+
+account_touch_metadata() {
+  printf '%s/%s/touch.json\n' "$ACCOUNTS_DIR" "$1"
 }
 
 require_auth() {
@@ -247,6 +259,133 @@ format_change_reset_epoch() {
   fi
 }
 
+reset_credit_expiry_epoch() {
+  local status_json="$1"
+  jq -r '
+    def epoch:
+      if . == null then empty
+      elif type == "number" then
+        (if . > 100000000000 then (. / 1000 | floor) else floor end)
+      elif type == "string" then
+        if test("^[0-9]+(\\.[0-9]+)?$") then
+          (tonumber | if . > 100000000000 then (. / 1000 | floor) else floor end)
+        else
+          (try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch empty)
+        end
+      else empty
+      end;
+    def expiry_field:
+      .expiresAt // .expires_at // .expires // .expiry // .expiryAt // .expiry_at //
+      .validUntil // .valid_until // .validThrough // .valid_through //
+      .expiration // .expirationAt // .expiration_at // .expirationTime // .expiration_time;
+    def object_expiry_values:
+      .. | objects | to_entries[]? |
+      select(.key | test("^(expiresAt|expires_at|expires|expiry|expiryAt|expiry_at|validUntil|valid_until|validThrough|valid_through|expiration|expirationAt|expiration_at|expirationTime|expiration_time)$"; "i")) |
+      .value | epoch;
+    def credit_expiry_values:
+      (.rateLimitResetCredits.credits // []) as $credits |
+      ([$credits[]? | select((.status // "") == "available") | expiry_field | epoch]) as $available |
+      if ($available | length) > 0 then $available[] else ($credits[]? | expiry_field | epoch) end;
+    ([credit_expiry_values] + [.rateLimitResetCredits | object_expiry_values]) as $epochs |
+    if ($epochs | length) == 0 then "-" else ($epochs | min | tostring) end
+  ' <<<"$status_json" 2>/dev/null || printf '%s' "-"
+}
+
+local_reset_expiry_epoch() {
+  local name="$1" file
+  file="$(account_reset_metadata "$name")"
+  if [[ ! -s "$file" ]] || ! command -v jq >/dev/null 2>&1; then
+    printf '%s' "-"
+    return 0
+  fi
+
+  jq -r '
+    .lastResetExpiresAt // .last_reset_expires_at //
+    .lastResetWeekExpiresAt // .last_reset_week_expires_at // "-"
+  ' "$file" 2>/dev/null || printf '%s' "-"
+}
+
+format_reset_left_display() {
+  local reset_left="${1:--}"
+  local reset_exp="${2:--}"
+  if [[ -n "$reset_exp" && "$reset_exp" != "-" && "$reset_exp" != "null" && "$reset_left" != "-" ]]; then
+    printf '%s (%s)' "$reset_left" "$reset_exp"
+  else
+    printf '%s' "$reset_left"
+  fi
+}
+
+record_reset_metadata() {
+  local name="$1" outcome="$2" five_reset_epoch="$3" week_reset_epoch="$4"
+  local file tmp now
+  [[ "$five_reset_epoch" =~ ^[0-9]+$ || "$week_reset_epoch" =~ ^[0-9]+$ ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  file="$(account_reset_metadata "$name")"
+  tmp="${file}.tmp.$$"
+  now="$(date +%s)"
+  jq -c -n \
+    --arg outcome "$outcome" \
+    --arg now "$now" \
+    --arg five "$five_reset_epoch" \
+    --arg week "$week_reset_epoch" '
+      def number_or_null($v):
+        if ($v | test("^[0-9]+$")) then ($v | tonumber) else null end;
+      {
+        lastResetAt: ($now | tonumber),
+        lastResetOutcome: $outcome,
+        lastResetExpiresAt: number_or_null($five),
+        lastResetWeekExpiresAt: number_or_null($week)
+      }
+    ' >"$tmp" 2>/dev/null || {
+      rm -f "$tmp"
+      return 0
+    }
+  install -m 600 "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+record_week_anchor() {
+  local name="$1" week_reset_epoch="$2"
+  local file tmp now
+  [[ "$week_reset_epoch" =~ ^[0-9]+$ ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  file="$(account_touch_metadata "$name")"
+  tmp="${file}.tmp.$$"
+  now="$(date +%s)"
+  jq -c -n \
+    --arg now "$now" \
+    --arg week "$week_reset_epoch" '
+      {
+        verifiedAt: ($now | tonumber),
+        anchoredWeekResetAt: ($week | tonumber)
+      }
+    ' >"$tmp" 2>/dev/null || {
+      rm -f "$tmp"
+      return 1
+    }
+  install -m 600 "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+local_week_anchor_epoch() {
+  local name="$1" file
+  file="$(account_touch_metadata "$name")"
+  if [[ ! -s "$file" ]] || ! command -v jq >/dev/null 2>&1; then
+    printf '%s' "-"
+    return 0
+  fi
+  jq -r '.anchoredWeekResetAt // "-"' "$file" 2>/dev/null || printf '%s' "-"
+}
+
+week_anchor_matches() {
+  local name="$1" observed_epoch="$2" saved_epoch
+  [[ "$observed_epoch" =~ ^[0-9]+$ ]] || return 1
+  saved_epoch="$(local_week_anchor_epoch "$name")"
+  [[ "$saved_epoch" =~ ^[0-9]+$ && "$saved_epoch" == "$observed_epoch" ]]
+}
+
 format_month_day() {
   local value="${1:-}"
   if [[ -z "$value" || "$value" == "null" ]]; then
@@ -308,6 +447,79 @@ account_display_name() {
   esac
 }
 
+query_reset_credits() {
+  local auth_path="$1"
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '%s\n' '{"rateLimitResetCredits":null,"resetCreditsError":"jq is required"}'
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    printf '%s\n' '{"rateLimitResetCredits":null,"resetCreditsError":"curl command not found"}'
+    return 0
+  fi
+
+  local token tmp http_code error_message
+  token="$(jq -r '.tokens.access_token // empty' "$auth_path" 2>/dev/null || true)"
+  if [[ -z "$token" || "$token" == "null" ]]; then
+    printf '%s\n' '{"rateLimitResetCredits":null,"resetCreditsError":null}'
+    return 0
+  fi
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/codex-account-reset-credits.XXXXXX")" || {
+    printf '%s\n' '{"rateLimitResetCredits":null,"resetCreditsError":"failed to create temporary reset credits response file"}'
+    return 0
+  }
+
+  http_code="$(curl -sS -L --max-time "${CODEX_ACCOUNT_RESET_CREDITS_TIMEOUT:-15}" -o "$tmp" -w '%{http_code}' \
+    -H "Authorization: Bearer $token" \
+    -H 'Accept: application/json' \
+    'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits' 2>/dev/null || true)"
+
+  if [[ "$http_code" != "200" ]]; then
+    case "$http_code" in
+      401)
+        error_message="HTTP 401: credential invalid, expired, or Authorization header missing/incorrect"
+        ;;
+      000|"")
+        error_message="reset credits request failed"
+        ;;
+      *)
+        error_message="reset credits request returned HTTP $http_code"
+        ;;
+    esac
+    rm -f "$tmp"
+    jq -cn --arg error "$error_message" '{rateLimitResetCredits:null, resetCreditsError:$error}'
+    return 0
+  fi
+
+  if ! jq -e . "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    printf '%s\n' '{"rateLimitResetCredits":null,"resetCreditsError":"reset credits response was not JSON"}'
+    return 0
+  fi
+
+  jq -c '
+    def credits:
+      .credits // .items // .data // .rate_limit_reset_credits // .rateLimitResetCredits // [];
+    {
+      rateLimitResetCredits: {
+        availableCount: (.available_count // .availableCount // .available // (credits | map(select((.status // "") == "available")) | length)),
+        totalEarnedCount: (.total_earned_count // .totalEarnedCount // null),
+        credits: [
+          credits[]? | {
+            status: (.status // null),
+            title: (.title // null),
+            grantedAt: (.granted_at // .grantedAt // null),
+            expiresAt: (.expires_at // .expiresAt // null)
+          }
+        ]
+      },
+      resetCreditsError: null
+    }
+  ' "$tmp" 2>/dev/null || printf '%s\n' '{"rateLimitResetCredits":null,"resetCreditsError":"failed to parse reset credits response"}'
+  rm -f "$tmp"
+}
+
 query_account_status() {
   local auth_path="$1"
   if ! command -v jq >/dev/null 2>&1; then
@@ -319,7 +531,7 @@ query_account_status() {
     return 0
   fi
 
-  local tmp_home limits_response token_metadata line rpc_in rpc_out rpc_pid deadline
+  local tmp_home limits_response reset_credits_response token_metadata line rpc_in rpc_out rpc_pid deadline
   tmp_home="$(mktemp -d "$ACCOUNTS_DIR/.rpc.XXXXXX")" || {
     printf '%s\n' '{"error":"failed to create temporary CODEX_HOME"}'
     return 0
@@ -367,26 +579,29 @@ query_account_status() {
   exec {rpc_out}<&- 2>/dev/null || true
 
   token_metadata="$(decode_auth_metadata "$tmp_home/auth.json")"
+  reset_credits_response="$(query_reset_credits "$tmp_home/auth.json")"
   if [[ -s "$tmp_home/auth.json" ]]; then
     install -m 600 "$tmp_home/auth.json" "$auth_path"
   fi
   cleanup_tmp_dir "$tmp_home"
 
   [[ -n "$limits_response" ]] || limits_response='{}'
+  [[ -n "$reset_credits_response" ]] || reset_credits_response='{}'
   [[ -n "$token_metadata" ]] || token_metadata='{}'
 
-  jq -c -n --argjson limits "$limits_response" --argjson token "$token_metadata" '
+  jq -c -n --argjson limits "$limits_response" --argjson resetCredits "$reset_credits_response" --argjson token "$token_metadata" '
     {
       account: null,
       requiresOpenaiAuth: null,
       rateLimits: ($limits.result.rateLimits // null),
       rateLimitsByLimitId: ($limits.result.rateLimitsByLimitId // null),
-      rateLimitResetCredits: ($limits.result.rateLimitResetCredits // null),
+      rateLimitResetCredits: ($resetCredits.rateLimitResetCredits // $limits.result.rateLimitResetCredits // null),
       tokenPlanType: ($token.tokenPlanType // null),
       subscriptionActiveUntil: ($token.subscriptionActiveUntil // null),
       subscriptionLastChecked: ($token.subscriptionLastChecked // null),
       accountError: null,
-      rateLimitError: ($limits.error.message // null)
+      rateLimitError: ($limits.error.message // null),
+      resetCreditsError: ($resetCredits.resetCreditsError // null)
     }
   ' 2>/dev/null || printf '%s\n' '{"error":"failed to parse app-server response"}'
 }
@@ -416,7 +631,7 @@ consume_reset_credit() {
     return 0
   fi
 
-  local tmp_home consume_response limits_response token_metadata line rpc_in rpc_out rpc_pid deadline
+  local tmp_home consume_response limits_response reset_credits_response token_metadata line rpc_in rpc_out rpc_pid deadline
   tmp_home="$(mktemp -d "$ACCOUNTS_DIR/.rpc.XXXXXX")" || {
     printf '%s\n' '{"resetError":"failed to create temporary CODEX_HOME"}'
     return 0
@@ -476,6 +691,7 @@ consume_reset_credit() {
   exec {rpc_out}<&- 2>/dev/null || true
 
   token_metadata="$(decode_auth_metadata "$tmp_home/auth.json")"
+  reset_credits_response="$(query_reset_credits "$tmp_home/auth.json")"
   if [[ -s "$tmp_home/auth.json" ]]; then
     install -m 600 "$tmp_home/auth.json" "$auth_path"
   fi
@@ -483,20 +699,22 @@ consume_reset_credit() {
 
   [[ -n "$consume_response" ]] || consume_response='{}'
   [[ -n "$limits_response" ]] || limits_response='{}'
+  [[ -n "$reset_credits_response" ]] || reset_credits_response='{}'
   [[ -n "$token_metadata" ]] || token_metadata='{}'
 
-  jq -c -n --argjson consume "$consume_response" --argjson limits "$limits_response" --argjson token "$token_metadata" '
+  jq -c -n --argjson consume "$consume_response" --argjson limits "$limits_response" --argjson resetCredits "$reset_credits_response" --argjson token "$token_metadata" '
     {
       outcome: ($consume.result.outcome // null),
       rateLimits: ($limits.result.rateLimits // null),
       rateLimitsByLimitId: ($limits.result.rateLimitsByLimitId // null),
-      rateLimitResetCredits: ($limits.result.rateLimitResetCredits // null),
+      rateLimitResetCredits: ($resetCredits.rateLimitResetCredits // $limits.result.rateLimitResetCredits // null),
       tokenPlanType: ($token.tokenPlanType // null),
       subscriptionActiveUntil: ($token.subscriptionActiveUntil // null),
       subscriptionLastChecked: ($token.subscriptionLastChecked // null),
       accountError: null,
       resetError: ($consume.error.message // null),
-      rateLimitError: ($limits.error.message // null)
+      rateLimitError: ($limits.error.message // null),
+      resetCreditsError: ($resetCredits.resetCreditsError // null)
     }
   ' 2>/dev/null || printf '%s\n' '{"resetError":"failed to parse app-server response"}'
 }
@@ -572,6 +790,8 @@ touch_reply_ok() {
 
 touch_prompt() {
   local chars="${1:-0}"
+  local nonce
+  nonce="$(date +%s%N 2>/dev/null || printf '%s-%s' "$(date +%s)" "$RANDOM")"
   if [[ "$chars" =~ ^[0-9]+$ ]] && (( chars > 0 )); then
     local chunk body
     chunk="anchor-token-input "
@@ -580,11 +800,11 @@ touch_prompt() {
       body="${body}${chunk}"
     done
     body="${body:0:chars}"
-    printf '1+1等于几？只回答数字 2。\nIgnore this filler text except as input tokens:\n%s\n' "$body"
+    printf '1+1等于几？只回答数字 2。\nWeekly anchor nonce: %s\nIgnore this filler text except as input tokens:\n%s\n' "$nonce" "$body"
     return 0
   fi
 
-  printf '1+1等于几？只回答数字 2。'
+  printf '1+1等于几？只回答数字 2。\nWeekly anchor nonce: %s' "$nonce"
 }
 
 touch_model() {
@@ -644,16 +864,22 @@ format_rate_limit_fields() {
       if . < 0 then -. else . end;
     def near($a; $b; $max_delta):
       ((($a // 0) - $b) | absval) <= $max_delta;
-    def primary_probe:
-      (.rateLimits.primary != null)
-      and ((.rateLimits.primary.usedPercent // 0) <= 1)
-      and near(.rateLimits.primary.resetsAt; ((now | floor) + 18000); 180);
-    def secondary_probe:
-      (.rateLimits.secondary != null)
-      and ((.rateLimits.secondary.usedPercent // 0) <= 0.1)
-      and near(.rateLimits.secondary.resetsAt; ((now | floor) + 604800); 180);
-    def probe_only:
-      primary_probe and secondary_probe;
+    def windows:
+      [.rateLimits.primary, .rateLimits.secondary] | map(select(. != null));
+    def duration_mins:
+      (.windowDurationMins // null | tonumber?);
+    def five_window:
+      ([windows[] | select(duration_mins == 300)] | first) //
+      (if (.rateLimits.primary.windowDurationMins // null) == null
+       then .rateLimits.primary else null end);
+    def week_window:
+      ([windows[] | select(duration_mins == 10080)] | first) //
+      (if (.rateLimits.secondary.windowDurationMins // null) == null
+       then .rateLimits.secondary else null end);
+    def window_probe($w; $duration):
+      ($w != null)
+      and (($w.usedPercent // 0) <= 1)
+      and near($w.resetsAt; ((now | floor) + ($duration * 60)); 180);
     def plan:
       .rateLimits.planType // .account.planType // .tokenPlanType // (if .account.type == "apiKey" then "apiKey" else "unknown" end);
     def err:
@@ -663,24 +889,80 @@ format_rate_limit_fields() {
     plan as $plan |
     (active_plan($plan)) as $active |
     (err) as $err |
+    (five_window) as $five |
+    (week_window) as $week |
+    (window_probe($five; 300)) as $five_probe |
+    (window_probe($week; 10080)) as $week_probe |
     [
       $plan,
       (if ($err | length) > 0 then
         (if auth_err($err) then "relogin" elif $active then "unavail" else "expired" end)
        elif (.rateLimits.rateLimitReachedType // null) != null then "limited"
-       elif probe_only then "probe"
-       elif primary_probe then "probe5h"
+       elif $five == null and $week == null then "unavail"
+       elif $five_probe and $week_probe then "probe"
+       elif $five_probe then "probe5h"
+       elif $week_probe then "probeweek"
        elif $active then "ok"
        else "expired"
        end),
-      pct_left(.rateLimits.primary),
-      reset_at(.rateLimits.primary),
-      pct_left(.rateLimits.secondary),
-      reset_at(.rateLimits.secondary),
+      pct_left($five),
+      reset_at($five),
+      pct_left($week),
+      reset_at($week),
       reset_credits,
       (if ($err | length) > 0 then $err else (.rateLimits.rateLimitReachedType // "") end)
     ] | @tsv
   ' <<<"$status_json"
+}
+
+rate_limit_layout() {
+  local status_json="$1"
+  jq -r '
+    def windows:
+      [.rateLimits.primary, .rateLimits.secondary] | map(select(. != null));
+    def duration_mins:
+      (.windowDurationMins // null | tonumber?);
+    ([windows[] | select(duration_mins == 300)] | length) as $five |
+    ([windows[] | select(duration_mins == 10080)] | length) as $week |
+    if $five == 0 and $week > 0 then "weekly-only"
+    elif $five > 0 and $week > 0 then "five-and-week"
+    elif $five > 0 then "five-only"
+    else "unknown"
+    end
+  ' <<<"$status_json" 2>/dev/null || printf '%s\n' "unknown"
+}
+
+observe_week_anchor() {
+  local name="$1" auth="$2" current="$3" initial_epoch="$4" samples="$5" delay_s="$6"
+  local sample status_json plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note
+  local previous_epoch="$initial_epoch" stable_matches=0
+
+  [[ "$initial_epoch" =~ ^[0-9]+$ ]] || return 1
+  (( samples >= 3 )) || samples=3
+
+  for (( sample = 2; sample <= samples; sample++ )); do
+    sleep "$delay_s"
+    status_json="$(query_account_status "$auth")"
+    if [[ "$name" == "$current" && -s "$auth" ]]; then
+      install_auth "$auth"
+    fi
+    IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+    week_reset_epoch="${week_reset_epoch:--}"
+    if [[ "$week_reset_epoch" =~ ^[0-9]+$ && "$week_reset_epoch" == "$previous_epoch" ]]; then
+      stable_matches=$((stable_matches + 1))
+    else
+      stable_matches=0
+    fi
+    previous_epoch="$week_reset_epoch"
+
+    # Three consecutive identical observations rule out the moving now+7d probe.
+    if (( stable_matches >= 2 )); then
+      record_week_anchor "$name" "$week_reset_epoch"
+      printf '%s\n' "$week_reset_epoch"
+      return 0
+    fi
+  done
+  return 1
 }
 
 stable_limit_state() {
@@ -696,7 +978,7 @@ stable_limit_state() {
 
 change_usable_state() {
   case "${1:-}" in
-    ok|limited|probe|probe5h)
+    ok|limited|probe|probe5h|probeweek)
       return 0
       ;;
     *)
@@ -720,16 +1002,22 @@ change_candidate_fields() {
       if . < 0 then -. else . end;
     def near($a; $b; $max_delta):
       ((($a // 0) - $b) | absval) <= $max_delta;
-    def primary_probe:
-      (.rateLimits.primary != null)
-      and ((.rateLimits.primary.usedPercent // 0) <= 1)
-      and near(.rateLimits.primary.resetsAt; ((now | floor) + 18000); 180);
-    def secondary_probe:
-      (.rateLimits.secondary != null)
-      and ((.rateLimits.secondary.usedPercent // 0) <= 0.1)
-      and near(.rateLimits.secondary.resetsAt; ((now | floor) + 604800); 180);
-    def probe_only:
-      primary_probe and secondary_probe;
+    def windows:
+      [.rateLimits.primary, .rateLimits.secondary] | map(select(. != null));
+    def duration_mins:
+      (.windowDurationMins // null | tonumber?);
+    def five_window:
+      ([windows[] | select(duration_mins == 300)] | first) //
+      (if (.rateLimits.primary.windowDurationMins // null) == null
+       then .rateLimits.primary else null end);
+    def week_window:
+      ([windows[] | select(duration_mins == 10080)] | first) //
+      (if (.rateLimits.secondary.windowDurationMins // null) == null
+       then .rateLimits.secondary else null end);
+    def window_probe($w; $duration):
+      ($w != null)
+      and (($w.usedPercent // 0) <= 1)
+      and near($w.resetsAt; ((now | floor) + ($duration * 60)); 180);
     def plan:
       .rateLimits.planType // .account.planType // .tokenPlanType // (if .account.type == "apiKey" then "apiKey" else "unknown" end);
     def err:
@@ -739,18 +1027,24 @@ change_candidate_fields() {
     plan as $plan |
     (active_plan($plan)) as $active |
     (err) as $err |
+    (five_window) as $five |
+    (week_window) as $week |
+    (window_probe($five; 300)) as $five_probe |
+    (window_probe($week; 10080)) as $week_probe |
     [
       (if ($err | length) > 0 then
         (if auth_err($err) then "relogin" elif $active then "unavail" else "expired" end)
        elif (.rateLimits.rateLimitReachedType // null) != null then "limited"
-       elif probe_only then "probe"
-       elif primary_probe then "probe5h"
+       elif $five == null and $week == null then "unavail"
+       elif $five_probe and $week_probe then "probe"
+       elif $five_probe then "probe5h"
+       elif $week_probe then "probeweek"
        elif $active then "ok"
        else "expired"
        end),
-      pct_left_num(.rateLimits.primary),
-      pct_left_num(.rateLimits.secondary),
-      reset_at_num(.rateLimits.secondary),
+      pct_left_num($five),
+      pct_left_num($week),
+      reset_at_num($week),
       (if ($err | length) > 0 then $err else (.rateLimits.rateLimitReachedType // "") end)
     ] | @tsv
   ' <<<"$status_json"
@@ -771,21 +1065,21 @@ cmd_list() {
   done
 
   lock
-  local current found name auth marker probe_seen=0
+  local current found name auth marker week_probe_seen=0
   current="$(get_current)"
   found=0
 
   shopt -s nullglob
   for auth in "$ACCOUNTS_DIR"/*/auth.json; do
     if (( show_limits && found == 0 )); then
-      printf '%s %-34s %-9s %-8s %-11s %-10s %-11s %-10s\n' " " "account(plan)" "status" "5h_left" "5h_reset" "week_left" "week_reset" "reset_left"
+      printf '%s %-24s %-10s %-11s %-18s\n' " " "account(plan)" "week_left" "week_reset" "reset_left"
     fi
     found=1
     name="$(basename "$(dirname "$auth")")"
     marker=" "
     [[ "$name" == "$current" ]] && marker="*"
     if (( show_limits )); then
-      local status_json display_name plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note five_reset week_reset
+      local status_json display_name plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note five_reset week_reset reset_expiry_epoch reset_exp reset_left_display anchored_week=0
       debug_log "$name limits=read"
       status_json="$(query_account_status "$auth")"
       if [[ "$name" == "$current" && -s "$auth" ]]; then
@@ -793,20 +1087,39 @@ cmd_list() {
       fi
       IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
       reset_left="${reset_left:--}"
-      [[ "$state" == "probe" || "$state" == "probe5h" ]] && probe_seen=1
+      if [[ "$state" == "probe" || "$state" == "probeweek" ]]; then
+        if week_anchor_matches "$name" "$week_reset_epoch"; then
+          anchored_week=1
+        else
+          week_probe_seen=1
+        fi
+      fi
       if [[ "$state" == "probe" ]]; then
         five_left="~100%"
         five_reset_epoch="-"
-        week_left="~100%"
-        week_reset_epoch="-"
+        if (( ! anchored_week )); then
+          week_left="~100%"
+          week_reset_epoch="-"
+        fi
       elif [[ "$state" == "probe5h" ]]; then
         five_left="~100%"
         five_reset_epoch="-"
+      elif [[ "$state" == "probeweek" ]]; then
+        if (( ! anchored_week )); then
+          week_left="~100%"
+          week_reset_epoch="-"
+        fi
       fi
       five_reset="$(format_reset_epoch "$five_reset_epoch")"
       week_reset="$(format_reset_epoch "$week_reset_epoch")"
+      reset_expiry_epoch="$(reset_credit_expiry_epoch "$status_json")"
+      if [[ -z "$reset_expiry_epoch" || "$reset_expiry_epoch" == "-" || "$reset_expiry_epoch" == "null" ]]; then
+        reset_expiry_epoch="$(local_reset_expiry_epoch "$name")"
+      fi
+      reset_exp="$(format_reset_epoch "$reset_expiry_epoch")"
+      reset_left_display="$(format_reset_left_display "$reset_left" "$reset_exp")"
       display_name="$(account_display_name "$name" "$status_json")"
-      printf '%s %-34s %-9s %-8s %-11s %-10s %-11s %-10s\n' "$marker" "$display_name" "$state" "$five_left" "$five_reset" "$week_left" "$week_reset" "$reset_left"
+      printf '%s %-24s %-10s %-11s %-18s\n' "$marker" "$display_name" "$week_left" "$week_reset" "$reset_left_display"
     else
       local metadata_json display_name
       metadata_json="$(decode_auth_metadata "$auth")"
@@ -816,8 +1129,8 @@ cmd_list() {
   done
   shopt -u nullglob
   (( found )) || echo "No saved accounts. Use: codex-account save <name>"
-  if (( probe_seen )); then
-    echo "note: status=probe/probe5h means the server did not return a stable 5h usage window; query-induced reset times are hidden."
+  if (( week_probe_seen )); then
+    echo "note: some accounts returned an unanchored weekly window; query-relative reset times are hidden."
   fi
 }
 
@@ -871,7 +1184,7 @@ cmd_change() {
 
   lock
   local current found=0 eligible=0 name auth status_json state five_left week_left week_reset note
-  local best_name="" best_state="" best_five_left=-1 best_week_left=-1 best_week_reset=9999999999
+  local best_name="" best_state="" best_week_left=-1 best_week_reset=9999999999
   current="$(get_current)"
 
   shopt -s nullglob
@@ -890,27 +1203,29 @@ cmd_change() {
 
     case "$state" in
       probe)
-        # A probe-only account has not exposed anchored 5h/week windows yet.
-        # Treat it like the list view does: usable, but with hidden reset times.
-        five_left=100
         week_left=100
-        week_reset=9999999999
+        if ! week_anchor_matches "$name" "$week_reset"; then
+          week_reset=9999999999
+        fi
         ;;
       probe5h)
-        # The 5h window is query-induced/unstable, but usage is effectively empty.
-        five_left=100
+        # Legacy 5h probing does not affect weekly account selection.
+        ;;
+      probeweek)
+        week_left=100
+        if ! week_anchor_matches "$name" "$week_reset"; then
+          week_reset=9999999999
+        fi
         ;;
     esac
 
-    if change_usable_state "$state" && (( five_left >= 70 && week_left >= 0 )); then
+    if change_usable_state "$state" && (( week_left >= 0 )); then
       eligible=1
       if (( week_left > best_week_left )) \
         || (( week_left == best_week_left && week_reset < best_week_reset )) \
-        || (( week_left == best_week_left && week_reset == best_week_reset && five_left > best_five_left )) \
-        || [[ "$name" == "$current" && "$best_name" != "$current" && "$week_left" == "$best_week_left" && "$week_reset" == "$best_week_reset" && "$five_left" == "$best_five_left" ]]; then
+        || [[ "$name" == "$current" && "$best_name" != "$current" && "$week_left" == "$best_week_left" && "$week_reset" == "$best_week_reset" ]]; then
         best_name="$name"
         best_state="$state"
-        best_five_left="$five_left"
         best_week_left="$week_left"
         best_week_reset="$week_reset"
       fi
@@ -919,18 +1234,18 @@ cmd_change() {
   shopt -u nullglob
 
   (( found )) || die "no saved accounts; use: codex-account save <name>"
-  (( eligible )) || die "no saved account has usable 5h_left >= 70% and readable week_left"
+  (( eligible )) || die "no saved account has a usable, readable weekly limit"
 
   if [[ "$best_name" == "$current" ]]; then
     install_auth "$(account_auth "$best_name")"
-    printf "Already using best Codex account '%s' (status=%s 5h_left=%s%% week_left=%s%% week_reset=%s).\n" \
-      "$best_name" "$best_state" "$best_five_left" "$best_week_left" "$(format_change_reset_epoch "$best_week_reset")"
+    printf "Already using best Codex account '%s' (status=%s week_left=%s%% week_reset=%s).\n" \
+      "$best_name" "$best_state" "$best_week_left" "$(format_change_reset_epoch "$best_week_reset")"
     return 0
   fi
 
   switch_account_locked "$best_name"
-  printf "Switched Codex account to '%s' (status=%s 5h_left=%s%% week_left=%s%% week_reset=%s).\n" \
-    "$best_name" "$best_state" "$best_five_left" "$best_week_left" "$(format_change_reset_epoch "$best_week_reset")"
+  printf "Switched Codex account to '%s' (status=%s week_left=%s%% week_reset=%s).\n" \
+    "$best_name" "$best_state" "$best_week_left" "$(format_change_reset_epoch "$best_week_reset")"
 }
 
 cmd_rest() {
@@ -981,8 +1296,8 @@ cmd_rest() {
     reset_left="${reset_left:--}"
     five_reset="$(format_reset_epoch "$five_reset_epoch")"
     week_reset="$(format_reset_epoch "$week_reset_epoch")"
-    printf "%s reset dry-run; status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
-      "$name" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+    printf "%s reset dry-run; status=%s week_left=%s week_reset=%s reset_left=%s\n" \
+      "$name" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
     return 0
   fi
 
@@ -1007,29 +1322,32 @@ cmd_rest() {
   five_reset="$(format_reset_epoch "$five_reset_epoch")"
   week_reset="$(format_reset_epoch "$week_reset_epoch")"
   rate_limit_error="$(jq -r '.rateLimitError // empty' <<<"$result_json" 2>/dev/null || true)"
+  if [[ "$outcome" == "reset" || "$outcome" == "alreadyRedeemed" ]]; then
+    record_reset_metadata "$name" "$outcome" "$five_reset_epoch" "$week_reset_epoch"
+  fi
 
   case "$outcome" in
     reset)
-      printf "%s reset credit consumed; status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
-        "$name" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+      printf "%s reset credit consumed; status=%s week_left=%s week_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
       ;;
     alreadyRedeemed)
-      printf "%s reset already redeemed for this idempotency key; status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
-        "$name" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+      printf "%s reset already redeemed for this idempotency key; status=%s week_left=%s week_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
       ;;
     nothingToReset)
-      printf "%s reset not used; outcome=nothingToReset status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
-        "$name" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+      printf "%s reset not used; outcome=nothingToReset status=%s week_left=%s week_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
       status=1
       ;;
     noCredit)
-      printf "%s reset not used; outcome=noCredit status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
-        "$name" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+      printf "%s reset not used; outcome=noCredit status=%s week_left=%s week_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
       status=1
       ;;
     *)
-      printf "%s reset finished with unknown outcome=%s; status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s reset_left=%s\n" \
-        "$name" "$outcome" "${state:-unknown}" "${five_left:--}" "$five_reset" "${week_left:--}" "$week_reset" "$reset_left"
+      printf "%s reset finished with unknown outcome=%s; status=%s week_left=%s week_reset=%s reset_left=%s\n" \
+        "$name" "$outcome" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
       status=1
       ;;
   esac
@@ -1093,7 +1411,7 @@ verify_touched_account() {
   local model="$6"
   local effort="$7"
   local touch_chars="$8"
-  local attempt status_json plan state five_left five_reset_epoch week_left week_reset_epoch note five_reset week_reset
+  local attempt status_json layout plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note five_reset week_reset anchored_epoch
 
   state="unavail"
   five_left="-"
@@ -1101,23 +1419,44 @@ verify_touched_account() {
   week_left="-"
   week_reset_epoch="-"
 
-  for (( attempt = 1; attempt <= retries; attempt++ )); do
-    status_json="$(query_account_status "$auth")"
-    if [[ "$name" == "$current" && -s "$auth" ]]; then
-      install_auth "$auth"
-    fi
-    IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch note < <(format_rate_limit_fields "$status_json")
-    state="${state:-unavail}"
-    five_left="${five_left:--}"
-    five_reset_epoch="${five_reset_epoch:--}"
-    week_left="${week_left:--}"
-    week_reset_epoch="${week_reset_epoch:--}"
+  status_json="$(query_account_status "$auth")"
+  if [[ "$name" == "$current" && -s "$auth" ]]; then
+    install_auth "$auth"
+  fi
+  layout="$(rate_limit_layout "$status_json")"
+  IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+  state="${state:-unavail}"
+  five_left="${five_left:--}"
+  five_reset_epoch="${five_reset_epoch:--}"
+  week_left="${week_left:--}"
+  week_reset_epoch="${week_reset_epoch:--}"
 
-    stable_limit_state "$state" && break
-    if (( attempt < retries )); then
-      sleep "$delay_s"
+  if [[ "$layout" == "weekly-only" ]]; then
+    (( retries >= 4 )) || retries=4
+    if anchored_epoch="$(observe_week_anchor "$name" "$auth" "$current" "$week_reset_epoch" "$retries" "$delay_s")"; then
+      week_reset_epoch="$anchored_epoch"
+      five_reset="$(format_reset_epoch "$five_reset_epoch")"
+      week_reset="$(format_reset_epoch "$week_reset_epoch")"
+      printf '%s touch verified; model=%s effort=%s chars=%s status=week-anchored week_left=%s week_reset=%s\n' \
+        "$name" "$model" "$effort" "$touch_chars" "$week_left" "$week_reset"
+      return 0
     fi
-  done
+  else
+    for (( attempt = 2; attempt <= retries; attempt++ )); do
+      stable_limit_state "$state" && break
+      sleep "$delay_s"
+      status_json="$(query_account_status "$auth")"
+      if [[ "$name" == "$current" && -s "$auth" ]]; then
+        install_auth "$auth"
+      fi
+      IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+      state="${state:-unavail}"
+      five_left="${five_left:--}"
+      five_reset_epoch="${five_reset_epoch:--}"
+      week_left="${week_left:--}"
+      week_reset_epoch="${week_reset_epoch:--}"
+    done
+  fi
 
   if [[ "$state" == "probe" ]]; then
     five_left="~100%"
@@ -1127,11 +1466,17 @@ verify_touched_account() {
   elif [[ "$state" == "probe5h" ]]; then
     five_left="~100%"
     five_reset_epoch="-"
+  elif [[ "$state" == "probeweek" ]]; then
+    week_left="~100%"
+    week_reset_epoch="-"
   fi
   five_reset="$(format_reset_epoch "$five_reset_epoch")"
   week_reset="$(format_reset_epoch "$week_reset_epoch")"
 
   if stable_limit_state "$state"; then
+    if [[ "$week_reset_epoch" =~ ^[0-9]+$ ]]; then
+      record_week_anchor "$name" "$week_reset_epoch" || true
+    fi
     printf '%s touch verified; model=%s effort=%s chars=%s status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s\n' \
       "$name" "$model" "$effort" "$touch_chars" "$state" "$five_left" "$five_reset" "$week_left" "$week_reset"
     return 0
@@ -1139,7 +1484,7 @@ verify_touched_account() {
 
   printf '%s touch unverified; model=%s effort=%s chars=%s status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s\n' \
     "$name" "$model" "$effort" "$touch_chars" "$state" "$five_left" "$five_reset" "$week_left" "$week_reset"
-  if [[ "$state" == "probe" || "$state" == "probe5h" ]]; then
+  if [[ "$state" == "probe" || "$state" == "probe5h" || "$state" == "probeweek" ]]; then
     return 2
   fi
   return 1
@@ -1154,12 +1499,56 @@ touch_saved_account() {
   local verify_delay="${6:-5}"
   local until_stable="${7:-0}"
   local max_attempts="${8:-0}"
-  local auth reset_epoch model effort attempt verify_status
+  local auth reset_epoch model effort attempt verify_status window_label="5h"
+  local status_json layout plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note week_reset anchored_epoch preflight_samples
 
   auth="$(account_auth "$name")"
   model="$(touch_model)"
   effort="$(touch_effort)"
   attempt=1
+
+  # Detect the live layout before spending tokens. Weekly-only accounts are
+  # touched only when their reset epoch is still moving; verified anchors are
+  # persisted so later list/change calls can distinguish them from now+7d probes.
+  debug_log "$name touch=preflight"
+  status_json="$(query_account_status "$auth")"
+  if [[ "$name" == "$current" && -s "$auth" ]]; then
+    install_auth "$auth"
+  fi
+  layout="$(rate_limit_layout "$status_json")"
+  if [[ "$layout" == "weekly-only" ]]; then
+    window_label="weekly"
+    IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+    week_left="${week_left:--}"
+    week_reset_epoch="${week_reset_epoch:--}"
+    if stable_limit_state "$state"; then
+      if [[ "$week_reset_epoch" =~ ^[0-9]+$ ]]; then
+        record_week_anchor "$name" "$week_reset_epoch" || true
+      fi
+      week_reset="$(format_reset_epoch "$week_reset_epoch")"
+      printf '%s touch already anchored; status=%s week_left=%s week_reset=%s\n' \
+        "$name" "${state:-unknown}" "$week_left" "$week_reset"
+      return 0
+    fi
+    if week_anchor_matches "$name" "$week_reset_epoch"; then
+      week_reset="$(format_reset_epoch "$week_reset_epoch")"
+      printf '%s touch already anchored; status=week-anchored week_left=%s week_reset=%s\n' \
+        "$name" "$week_left" "$week_reset"
+      return 0
+    fi
+    preflight_samples="$verify_retries"
+    (( preflight_samples >= 4 )) || preflight_samples=4
+    if anchored_epoch="$(observe_week_anchor "$name" "$auth" "$current" "$week_reset_epoch" "$preflight_samples" "$verify_delay")"; then
+      week_reset="$(format_reset_epoch "$anchored_epoch")"
+      printf '%s touch already anchored; status=week-anchored week_left=%s week_reset=%s\n' \
+        "$name" "$week_left" "$week_reset"
+      return 0
+    fi
+  fi
+  if [[ "$layout" != "weekly-only" && "$layout" != "five-only" && "$layout" != "five-and-week" ]]; then
+    printf '%s touch skipped; no supported rate-limit window was detected (layout=%s)\n' "$name" "$layout" >&2
+    return 1
+  fi
 
   while :; do
     debug_log "$name touch=run attempt=$attempt model=$model effort=$effort chars=$touch_chars"
@@ -1185,22 +1574,27 @@ touch_saved_account() {
         return "$verify_status"
       fi
       if (( max_attempts > 0 && attempt >= max_attempts )); then
-        printf '%s touch stopped; reached max_attempts=%s while 5h window was still unstable\n' "$name" "$max_attempts" >&2
+        printf '%s touch stopped; reached max_attempts=%s while %s window was still unstable\n' "$name" "$max_attempts" "$window_label" >&2
         return "$verify_status"
       fi
       attempt=$((attempt + 1))
-      printf '%s touch retrying; 5h window still unstable attempt=%s chars=%s\n' "$name" "$attempt" "$touch_chars" >&2
+      printf '%s touch retrying; %s window still unstable attempt=%s chars=%s\n' "$name" "$window_label" "$attempt" "$touch_chars" >&2
       continue
     fi
 
-    reset_epoch=$(( $(date +%s) + 300 * 60 ))
-    printf '%s touch request sent; model=%s effort=%s chars=%s target_5h_reset_approx=%s\n' "$name" "$model" "$effort" "$touch_chars" "$(format_reset_epoch "$reset_epoch")"
+    if [[ "$layout" == "weekly-only" ]]; then
+      reset_epoch=$(( $(date +%s) + 10080 * 60 ))
+      printf '%s touch request sent; model=%s effort=%s chars=%s target_week_reset_approx=%s\n' "$name" "$model" "$effort" "$touch_chars" "$(format_reset_epoch "$reset_epoch")"
+    else
+      reset_epoch=$(( $(date +%s) + 300 * 60 ))
+      printf '%s touch request sent; model=%s effort=%s chars=%s target_5h_reset_approx=%s\n' "$name" "$model" "$effort" "$touch_chars" "$(format_reset_epoch "$reset_epoch")"
+    fi
     return 0
   done
 }
 
 touch_note() {
-  echo "note: target_5h_reset_approx is local and not confirmation that the server primary limit was anchored; 'codex-account list' queries live server limits."
+  echo "note: target reset times are local approximations; verified touch compares live server reset epochs."
 }
 
 cmd_touch() {
