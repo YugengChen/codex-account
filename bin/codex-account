@@ -44,22 +44,22 @@ Notes:
   Account names may contain only letters, digits, dot, underscore, and dash.
   Saved accounts are stored under ~/.codex/accounts with 700/600 permissions.
   list updates account information by reading live limits only; it never sends a model request.
-  list identifies rate-limit windows by windowDurationMins instead of assuming primary=5h and secondary=week.
+  list identifies 5h, weekly, and monthly rate-limit windows by windowDurationMins.
   list shows reset_left when rate limit reset credits are returned by Codex.
   list reads reset-credit details from ChatGPT and shows the nearest reset_exp inside reset_left when returned.
   Use --no, --no-touch, or --no-limits for the quick saved-account list without reading limits.
-  change reads live limits and chooses the account with the highest week_left.
-  If week_left ties, change chooses the account whose week_reset is sooner.
+  change reads live limits and chooses the account with the highest quota_left across weekly/monthly accounts.
+  If quota_left ties, change chooses the account whose quota_reset is sooner.
   rest consumes one official rate-limit reset credit for one saved account when a reset is eligible.
   rest uses app-server only; it does not send a model request.
   Reuse --idempotency-key KEY only when retrying the same reset attempt.
-  touch anchors weekly-only limits by sending usage, then verifies that week_reset stays fixed across live reads.
-  Accounts with an already verified weekly window are skipped without sending another model request.
+  touch anchors weekly-only or monthly-only limits by sending usage, then verifies that quota_reset stays fixed.
+  Accounts with an already verified weekly/monthly window are skipped without sending another model request.
   On legacy accounts with a 5h window, touch also starts a background codex exec session and asks a simple 1+1 question.
   By default, touch uses 100000 chars, verifies live limits, and repeats when the result is still probe.
   Use touch --minimal for the old one-shot minimal request, or --chars N/CODEX_ACCOUNT_TOUCH_CHARS to tune input size.
   Use --once or --max-attempts N to limit repeat touch attempts.
-  Touch can move the weekly or legacy 5h reset window; touch model/effort default to config.toml.
+  Touch can move the monthly, weekly, or legacy 5h reset window; touch model/effort default to config.toml.
   Override touch with CODEX_ACCOUNT_TOUCH_MODEL, CODEX_ACCOUNT_TOUCH_EFFORT, CODEX_ACCOUNT_TOUCH_VERIFY, or CODEX_ACCOUNT_TOUCH_MAX_ATTEMPTS.
   Removing the active account requires --force and clears the active Codex login.
 EOF
@@ -301,6 +301,7 @@ local_reset_expiry_epoch() {
 
   jq -r '
     .lastResetExpiresAt // .last_reset_expires_at //
+    .lastResetQuotaExpiresAt // .last_reset_quota_expires_at //
     .lastResetWeekExpiresAt // .last_reset_week_expires_at // "-"
   ' "$file" 2>/dev/null || printf '%s' "-"
 }
@@ -316,9 +317,9 @@ format_reset_left_display() {
 }
 
 record_reset_metadata() {
-  local name="$1" outcome="$2" five_reset_epoch="$3" week_reset_epoch="$4"
+  local name="$1" outcome="$2" five_reset_epoch="$3" quota_kind="$4" quota_duration_mins="$5" quota_reset_epoch="$6"
   local file tmp now
-  [[ "$five_reset_epoch" =~ ^[0-9]+$ || "$week_reset_epoch" =~ ^[0-9]+$ ]] || return 0
+  [[ "$five_reset_epoch" =~ ^[0-9]+$ || "$quota_reset_epoch" =~ ^[0-9]+$ ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
 
   file="$(account_reset_metadata "$name")"
@@ -328,14 +329,19 @@ record_reset_metadata() {
     --arg outcome "$outcome" \
     --arg now "$now" \
     --arg five "$five_reset_epoch" \
-    --arg week "$week_reset_epoch" '
+    --arg quota_kind "$quota_kind" \
+    --arg quota_duration "$quota_duration_mins" \
+    --arg quota_reset "$quota_reset_epoch" '
       def number_or_null($v):
         if ($v | test("^[0-9]+$")) then ($v | tonumber) else null end;
       {
         lastResetAt: ($now | tonumber),
         lastResetOutcome: $outcome,
         lastResetExpiresAt: number_or_null($five),
-        lastResetWeekExpiresAt: number_or_null($week)
+        lastResetQuotaKind: (if $quota_kind == "-" then null else $quota_kind end),
+        lastResetQuotaDurationMins: number_or_null($quota_duration),
+        lastResetQuotaExpiresAt: number_or_null($quota_reset),
+        lastResetWeekExpiresAt: (if $quota_kind == "week" then number_or_null($quota_reset) else null end)
       }
     ' >"$tmp" 2>/dev/null || {
       rm -f "$tmp"
@@ -345,10 +351,10 @@ record_reset_metadata() {
   rm -f "$tmp"
 }
 
-record_week_anchor() {
-  local name="$1" week_reset_epoch="$2"
+record_quota_anchor() {
+  local name="$1" quota_duration_mins="$2" quota_reset_epoch="$3"
   local file tmp now
-  [[ "$week_reset_epoch" =~ ^[0-9]+$ ]] || return 1
+  [[ "$quota_duration_mins" =~ ^[0-9]+$ && "$quota_reset_epoch" =~ ^[0-9]+$ ]] || return 1
   command -v jq >/dev/null 2>&1 || return 1
 
   file="$(account_touch_metadata "$name")"
@@ -356,10 +362,13 @@ record_week_anchor() {
   now="$(date +%s)"
   jq -c -n \
     --arg now "$now" \
-    --arg week "$week_reset_epoch" '
+    --arg duration "$quota_duration_mins" \
+    --arg reset "$quota_reset_epoch" '
       {
         verifiedAt: ($now | tonumber),
-        anchoredWeekResetAt: ($week | tonumber)
+        anchoredWindowDurationMins: ($duration | tonumber),
+        anchoredResetAt: ($reset | tonumber),
+        anchoredWeekResetAt: (if ($duration | tonumber) == 10080 then ($reset | tonumber) else null end)
       }
     ' >"$tmp" 2>/dev/null || {
       rm -f "$tmp"
@@ -369,21 +378,29 @@ record_week_anchor() {
   rm -f "$tmp"
 }
 
-local_week_anchor_epoch() {
+local_quota_anchor_fields() {
   local name="$1" file
   file="$(account_touch_metadata "$name")"
   if [[ ! -s "$file" ]] || ! command -v jq >/dev/null 2>&1; then
-    printf '%s' "-"
+    printf '%s\t%s\n' "-" "-"
     return 0
   fi
-  jq -r '.anchoredWeekResetAt // "-"' "$file" 2>/dev/null || printf '%s' "-"
+  jq -r '
+    if (.anchoredWindowDurationMins // null) != null and (.anchoredResetAt // null) != null then
+      [.anchoredWindowDurationMins, .anchoredResetAt]
+    elif (.anchoredWeekResetAt // null) != null then
+      [10080, .anchoredWeekResetAt]
+    else
+      ["-", "-"]
+    end | @tsv
+  ' "$file" 2>/dev/null || printf '%s\t%s\n' "-" "-"
 }
 
-week_anchor_matches() {
-  local name="$1" observed_epoch="$2" saved_epoch
-  [[ "$observed_epoch" =~ ^[0-9]+$ ]] || return 1
-  saved_epoch="$(local_week_anchor_epoch "$name")"
-  [[ "$saved_epoch" =~ ^[0-9]+$ && "$saved_epoch" == "$observed_epoch" ]]
+quota_anchor_matches() {
+  local name="$1" observed_duration="$2" observed_epoch="$3" saved_duration saved_epoch
+  [[ "$observed_duration" =~ ^[0-9]+$ && "$observed_epoch" =~ ^[0-9]+$ ]] || return 1
+  IFS=$'\t' read -r saved_duration saved_epoch < <(local_quota_anchor_fields "$name")
+  [[ "$saved_duration" == "$observed_duration" && "$saved_epoch" == "$observed_epoch" ]]
 }
 
 format_month_day() {
@@ -800,11 +817,11 @@ touch_prompt() {
       body="${body}${chunk}"
     done
     body="${body:0:chars}"
-    printf '1+1等于几？只回答数字 2。\nWeekly anchor nonce: %s\nIgnore this filler text except as input tokens:\n%s\n' "$nonce" "$body"
+    printf '1+1等于几？只回答数字 2。\nQuota anchor nonce: %s\nIgnore this filler text except as input tokens:\n%s\n' "$nonce" "$body"
     return 0
   fi
 
-  printf '1+1等于几？只回答数字 2。\nWeekly anchor nonce: %s' "$nonce"
+  printf '1+1等于几？只回答数字 2。\nQuota anchor nonce: %s' "$nonce"
 }
 
 touch_model() {
@@ -868,6 +885,8 @@ format_rate_limit_fields() {
       [.rateLimits.primary, .rateLimits.secondary] | map(select(. != null));
     def duration_mins:
       (.windowDurationMins // null | tonumber?);
+    def is_month_duration($duration):
+      ($duration != null and $duration >= 40320 and $duration <= 44640);
     def five_window:
       ([windows[] | select(duration_mins == 300)] | first) //
       (if (.rateLimits.primary.windowDurationMins // null) == null
@@ -876,8 +895,21 @@ format_rate_limit_fields() {
       ([windows[] | select(duration_mins == 10080)] | first) //
       (if (.rateLimits.secondary.windowDurationMins // null) == null
        then .rateLimits.secondary else null end);
+    def month_window:
+      ([windows[] | select(duration_mins as $duration | is_month_duration($duration))] | first);
+    def quota_window:
+      month_window // week_window;
+    def quota_kind($w):
+      ($w | duration_mins) as $duration |
+      if $w == null then "-"
+      elif is_month_duration($duration) then "month"
+      else "week"
+      end;
+    def quota_duration($w):
+      if $w == null then null else (($w | duration_mins) // 10080) end;
     def window_probe($w; $duration):
       ($w != null)
+      and ($duration != null)
       and (($w.usedPercent // 0) <= 1)
       and near($w.resetsAt; ((now | floor) + ($duration * 60)); 180);
     def plan:
@@ -890,25 +922,29 @@ format_rate_limit_fields() {
     (active_plan($plan)) as $active |
     (err) as $err |
     (five_window) as $five |
-    (week_window) as $week |
+    (quota_window) as $quota |
+    (quota_kind($quota)) as $quota_kind |
+    (quota_duration($quota)) as $quota_duration |
     (window_probe($five; 300)) as $five_probe |
-    (window_probe($week; 10080)) as $week_probe |
+    (window_probe($quota; $quota_duration)) as $quota_probe |
     [
       $plan,
       (if ($err | length) > 0 then
         (if auth_err($err) then "relogin" elif $active then "unavail" else "expired" end)
        elif (.rateLimits.rateLimitReachedType // null) != null then "limited"
-       elif $five == null and $week == null then "unavail"
-       elif $five_probe and $week_probe then "probe"
+       elif $five == null and $quota == null then "unavail"
+       elif $five_probe and $quota_probe then "probe"
        elif $five_probe then "probe5h"
-       elif $week_probe then "probeweek"
+       elif $quota_probe then (if $quota_kind == "month" then "probemonth" else "probeweek" end)
        elif $active then "ok"
        else "expired"
        end),
       pct_left($five),
       reset_at($five),
-      pct_left($week),
-      reset_at($week),
+      $quota_kind,
+      (if $quota_duration == null then "-" else ($quota_duration | tostring) end),
+      pct_left($quota),
+      reset_at($quota),
       reset_credits,
       (if ($err | length) > 0 then $err else (.rateLimits.rateLimitReachedType // "") end)
     ] | @tsv
@@ -924,7 +960,10 @@ rate_limit_layout() {
       (.windowDurationMins // null | tonumber?);
     ([windows[] | select(duration_mins == 300)] | length) as $five |
     ([windows[] | select(duration_mins == 10080)] | length) as $week |
-    if $five == 0 and $week > 0 then "weekly-only"
+    ([windows[] | select(duration_mins as $duration | $duration != null and $duration >= 40320 and $duration <= 44640)] | length) as $month |
+    if $five == 0 and $month > 0 then "monthly-only"
+    elif $five == 0 and $week > 0 then "weekly-only"
+    elif $five > 0 and $month > 0 then "five-and-month"
     elif $five > 0 and $week > 0 then "five-and-week"
     elif $five > 0 then "five-only"
     else "unknown"
@@ -932,12 +971,12 @@ rate_limit_layout() {
   ' <<<"$status_json" 2>/dev/null || printf '%s\n' "unknown"
 }
 
-observe_week_anchor() {
-  local name="$1" auth="$2" current="$3" initial_epoch="$4" samples="$5" delay_s="$6"
-  local sample status_json plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note
+observe_quota_anchor() {
+  local name="$1" auth="$2" current="$3" initial_duration="$4" initial_epoch="$5" samples="$6" delay_s="$7"
+  local sample status_json plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note
   local previous_epoch="$initial_epoch" stable_matches=0
 
-  [[ "$initial_epoch" =~ ^[0-9]+$ ]] || return 1
+  [[ "$initial_duration" =~ ^[0-9]+$ && "$initial_epoch" =~ ^[0-9]+$ ]] || return 1
   (( samples >= 3 )) || samples=3
 
   for (( sample = 2; sample <= samples; sample++ )); do
@@ -946,19 +985,20 @@ observe_week_anchor() {
     if [[ "$name" == "$current" && -s "$auth" ]]; then
       install_auth "$auth"
     fi
-    IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
-    week_reset_epoch="${week_reset_epoch:--}"
-    if [[ "$week_reset_epoch" =~ ^[0-9]+$ && "$week_reset_epoch" == "$previous_epoch" ]]; then
+    IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+    quota_duration="${quota_duration:--}"
+    quota_reset_epoch="${quota_reset_epoch:--}"
+    if [[ "$quota_duration" == "$initial_duration" && "$quota_reset_epoch" =~ ^[0-9]+$ && "$quota_reset_epoch" == "$previous_epoch" ]]; then
       stable_matches=$((stable_matches + 1))
     else
       stable_matches=0
     fi
-    previous_epoch="$week_reset_epoch"
+    previous_epoch="$quota_reset_epoch"
 
-    # Three consecutive identical observations rule out the moving now+7d probe.
+    # Three consecutive identical observations rule out a moving now+window probe.
     if (( stable_matches >= 2 )); then
-      record_week_anchor "$name" "$week_reset_epoch"
-      printf '%s\n' "$week_reset_epoch"
+      record_quota_anchor "$name" "$quota_duration" "$quota_reset_epoch"
+      printf '%s\n' "$quota_reset_epoch"
       return 0
     fi
   done
@@ -978,7 +1018,7 @@ stable_limit_state() {
 
 change_usable_state() {
   case "${1:-}" in
-    ok|limited|probe|probe5h|probeweek)
+    ok|limited|probe|probe5h|probeweek|probemonth)
       return 0
       ;;
     *)
@@ -1006,6 +1046,8 @@ change_candidate_fields() {
       [.rateLimits.primary, .rateLimits.secondary] | map(select(. != null));
     def duration_mins:
       (.windowDurationMins // null | tonumber?);
+    def is_month_duration($duration):
+      ($duration != null and $duration >= 40320 and $duration <= 44640);
     def five_window:
       ([windows[] | select(duration_mins == 300)] | first) //
       (if (.rateLimits.primary.windowDurationMins // null) == null
@@ -1014,8 +1056,21 @@ change_candidate_fields() {
       ([windows[] | select(duration_mins == 10080)] | first) //
       (if (.rateLimits.secondary.windowDurationMins // null) == null
        then .rateLimits.secondary else null end);
+    def month_window:
+      ([windows[] | select(duration_mins as $duration | is_month_duration($duration))] | first);
+    def quota_window:
+      month_window // week_window;
+    def quota_kind($w):
+      ($w | duration_mins) as $duration |
+      if $w == null then "-"
+      elif is_month_duration($duration) then "month"
+      else "week"
+      end;
+    def quota_duration($w):
+      if $w == null then null else (($w | duration_mins) // 10080) end;
     def window_probe($w; $duration):
       ($w != null)
+      and ($duration != null)
       and (($w.usedPercent // 0) <= 1)
       and near($w.resetsAt; ((now | floor) + ($duration * 60)); 180);
     def plan:
@@ -1028,23 +1083,27 @@ change_candidate_fields() {
     (active_plan($plan)) as $active |
     (err) as $err |
     (five_window) as $five |
-    (week_window) as $week |
+    (quota_window) as $quota |
+    (quota_kind($quota)) as $quota_kind |
+    (quota_duration($quota)) as $quota_duration |
     (window_probe($five; 300)) as $five_probe |
-    (window_probe($week; 10080)) as $week_probe |
+    (window_probe($quota; $quota_duration)) as $quota_probe |
     [
       (if ($err | length) > 0 then
         (if auth_err($err) then "relogin" elif $active then "unavail" else "expired" end)
        elif (.rateLimits.rateLimitReachedType // null) != null then "limited"
-       elif $five == null and $week == null then "unavail"
-       elif $five_probe and $week_probe then "probe"
+       elif $five == null and $quota == null then "unavail"
+       elif $five_probe and $quota_probe then "probe"
        elif $five_probe then "probe5h"
-       elif $week_probe then "probeweek"
+       elif $quota_probe then (if $quota_kind == "month" then "probemonth" else "probeweek" end)
        elif $active then "ok"
        else "expired"
        end),
       pct_left_num($five),
-      pct_left_num($week),
-      reset_at_num($week),
+      $quota_kind,
+      (if $quota_duration == null then "-" else ($quota_duration | tostring) end),
+      pct_left_num($quota),
+      reset_at_num($quota),
       (if ($err | length) > 0 then $err else (.rateLimits.rateLimitReachedType // "") end)
     ] | @tsv
   ' <<<"$status_json"
@@ -1065,53 +1124,55 @@ cmd_list() {
   done
 
   lock
-  local current found name auth marker week_probe_seen=0
+  local current found name auth marker quota_probe_seen=0
   current="$(get_current)"
   found=0
 
   shopt -s nullglob
   for auth in "$ACCOUNTS_DIR"/*/auth.json; do
     if (( show_limits && found == 0 )); then
-      printf '%s %-24s %-10s %-11s %-18s\n' " " "account(plan)" "week_left" "week_reset" "reset_left"
+      printf '%s %-24s %-7s %-10s %-11s %-18s\n' " " "account(plan)" "quota" "quota_left" "quota_reset" "reset_left"
     fi
     found=1
     name="$(basename "$(dirname "$auth")")"
     marker=" "
     [[ "$name" == "$current" ]] && marker="*"
     if (( show_limits )); then
-      local status_json display_name plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note five_reset week_reset reset_expiry_epoch reset_exp reset_left_display anchored_week=0
+      local status_json display_name plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note quota_reset reset_expiry_epoch reset_exp reset_left_display anchored_quota=0
       debug_log "$name limits=read"
       status_json="$(query_account_status "$auth")"
       if [[ "$name" == "$current" && -s "$auth" ]]; then
         install_auth "$auth"
       fi
-      IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+      IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
       reset_left="${reset_left:--}"
-      if [[ "$state" == "probe" || "$state" == "probeweek" ]]; then
-        if week_anchor_matches "$name" "$week_reset_epoch"; then
-          anchored_week=1
+      quota_kind="${quota_kind:--}"
+      quota_duration="${quota_duration:--}"
+      if [[ "$state" == "probe" || "$state" == "probeweek" || "$state" == "probemonth" ]]; then
+        if quota_anchor_matches "$name" "$quota_duration" "$quota_reset_epoch"; then
+          anchored_quota=1
         else
-          week_probe_seen=1
+          quota_probe_seen=1
         fi
       fi
       if [[ "$state" == "probe" ]]; then
         five_left="~100%"
         five_reset_epoch="-"
-        if (( ! anchored_week )); then
-          week_left="~100%"
-          week_reset_epoch="-"
+        if (( ! anchored_quota )); then
+          quota_left="~100%"
+          quota_reset_epoch="-"
         fi
       elif [[ "$state" == "probe5h" ]]; then
         five_left="~100%"
         five_reset_epoch="-"
-      elif [[ "$state" == "probeweek" ]]; then
-        if (( ! anchored_week )); then
-          week_left="~100%"
-          week_reset_epoch="-"
+      elif [[ "$state" == "probeweek" || "$state" == "probemonth" ]]; then
+        if (( ! anchored_quota )); then
+          quota_left="~100%"
+          quota_reset_epoch="-"
         fi
       fi
-      five_reset="$(format_reset_epoch "$five_reset_epoch")"
-      week_reset="$(format_reset_epoch "$week_reset_epoch")"
+      quota_left="${quota_left:--}"
+      quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
       reset_expiry_epoch="$(reset_credit_expiry_epoch "$status_json")"
       if [[ -z "$reset_expiry_epoch" || "$reset_expiry_epoch" == "-" || "$reset_expiry_epoch" == "null" ]]; then
         reset_expiry_epoch="$(local_reset_expiry_epoch "$name")"
@@ -1119,7 +1180,7 @@ cmd_list() {
       reset_exp="$(format_reset_epoch "$reset_expiry_epoch")"
       reset_left_display="$(format_reset_left_display "$reset_left" "$reset_exp")"
       display_name="$(account_display_name "$name" "$status_json")"
-      printf '%s %-24s %-10s %-11s %-18s\n' "$marker" "$display_name" "$week_left" "$week_reset" "$reset_left_display"
+      printf '%s %-24s %-7s %-10s %-11s %-18s\n' "$marker" "$display_name" "$quota_kind" "$quota_left" "$quota_reset" "$reset_left_display"
     else
       local metadata_json display_name
       metadata_json="$(decode_auth_metadata "$auth")"
@@ -1129,8 +1190,8 @@ cmd_list() {
   done
   shopt -u nullglob
   (( found )) || echo "No saved accounts. Use: codex-account save <name>"
-  if (( week_probe_seen )); then
-    echo "note: some accounts returned an unanchored weekly window; query-relative reset times are hidden."
+  if (( quota_probe_seen )); then
+    echo "note: some accounts returned an unanchored weekly/monthly window; query-relative reset times are hidden."
   fi
 }
 
@@ -1183,8 +1244,8 @@ cmd_change() {
   (($# == 0)) || die "change takes no arguments"
 
   lock
-  local current found=0 eligible=0 name auth status_json state five_left week_left week_reset note
-  local best_name="" best_state="" best_week_left=-1 best_week_reset=9999999999
+  local current found=0 eligible=0 name auth status_json state five_left quota_kind quota_duration quota_left quota_reset note
+  local best_name="" best_state="" best_quota_kind="" best_quota_left=-1 best_quota_reset=9999999999
   current="$(get_current)"
 
   shopt -s nullglob
@@ -1196,56 +1257,59 @@ cmd_change() {
     if [[ "$name" == "$current" && -s "$auth" ]]; then
       install_auth "$auth"
     fi
-    IFS=$'\t' read -r state five_left week_left week_reset note < <(change_candidate_fields "$status_json")
+    IFS=$'\t' read -r state five_left quota_kind quota_duration quota_left quota_reset note < <(change_candidate_fields "$status_json")
     five_left="${five_left:--1}"
-    week_left="${week_left:--1}"
-    week_reset="${week_reset:-9999999999}"
+    quota_kind="${quota_kind:--}"
+    quota_duration="${quota_duration:--}"
+    quota_left="${quota_left:--1}"
+    quota_reset="${quota_reset:-9999999999}"
 
     case "$state" in
       probe)
-        week_left=100
-        if ! week_anchor_matches "$name" "$week_reset"; then
-          week_reset=9999999999
+        quota_left=100
+        if ! quota_anchor_matches "$name" "$quota_duration" "$quota_reset"; then
+          quota_reset=9999999999
         fi
         ;;
       probe5h)
-        # Legacy 5h probing does not affect weekly account selection.
+        # Legacy 5h probing does not affect long-term quota selection.
         ;;
-      probeweek)
-        week_left=100
-        if ! week_anchor_matches "$name" "$week_reset"; then
-          week_reset=9999999999
+      probeweek|probemonth)
+        quota_left=100
+        if ! quota_anchor_matches "$name" "$quota_duration" "$quota_reset"; then
+          quota_reset=9999999999
         fi
         ;;
     esac
 
-    if change_usable_state "$state" && (( week_left >= 0 )); then
+    if change_usable_state "$state" && (( quota_left >= 0 )); then
       eligible=1
-      if (( week_left > best_week_left )) \
-        || (( week_left == best_week_left && week_reset < best_week_reset )) \
-        || [[ "$name" == "$current" && "$best_name" != "$current" && "$week_left" == "$best_week_left" && "$week_reset" == "$best_week_reset" ]]; then
+      if (( quota_left > best_quota_left )) \
+        || (( quota_left == best_quota_left && quota_reset < best_quota_reset )) \
+        || [[ "$name" == "$current" && "$best_name" != "$current" && "$quota_left" == "$best_quota_left" && "$quota_reset" == "$best_quota_reset" ]]; then
         best_name="$name"
         best_state="$state"
-        best_week_left="$week_left"
-        best_week_reset="$week_reset"
+        best_quota_kind="$quota_kind"
+        best_quota_left="$quota_left"
+        best_quota_reset="$quota_reset"
       fi
     fi
   done
   shopt -u nullglob
 
   (( found )) || die "no saved accounts; use: codex-account save <name>"
-  (( eligible )) || die "no saved account has a usable, readable weekly limit"
+  (( eligible )) || die "no saved account has a usable, readable weekly or monthly quota"
 
   if [[ "$best_name" == "$current" ]]; then
     install_auth "$(account_auth "$best_name")"
-    printf "Already using best Codex account '%s' (status=%s week_left=%s%% week_reset=%s).\n" \
-      "$best_name" "$best_state" "$best_week_left" "$(format_change_reset_epoch "$best_week_reset")"
+    printf "Already using best Codex account '%s' (status=%s quota=%s quota_left=%s%% quota_reset=%s).\n" \
+      "$best_name" "$best_state" "$best_quota_kind" "$best_quota_left" "$(format_change_reset_epoch "$best_quota_reset")"
     return 0
   fi
 
   switch_account_locked "$best_name"
-  printf "Switched Codex account to '%s' (status=%s week_left=%s%% week_reset=%s).\n" \
-    "$best_name" "$best_state" "$best_week_left" "$(format_change_reset_epoch "$best_week_reset")"
+  printf "Switched Codex account to '%s' (status=%s quota=%s quota_left=%s%% quota_reset=%s).\n" \
+    "$best_name" "$best_state" "$best_quota_kind" "$best_quota_left" "$(format_change_reset_epoch "$best_quota_reset")"
 }
 
 cmd_rest() {
@@ -1283,7 +1347,7 @@ cmd_rest() {
   lock
   require_account "$name"
 
-  local current auth status_json plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note five_reset week_reset
+  local current auth status_json plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note quota_reset
   current="$(get_current)"
   auth="$(account_auth "$name")"
 
@@ -1292,12 +1356,11 @@ cmd_rest() {
     if [[ "$name" == "$current" && -s "$auth" ]]; then
       install_auth "$auth"
     fi
-    IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+    IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
     reset_left="${reset_left:--}"
-    five_reset="$(format_reset_epoch "$five_reset_epoch")"
-    week_reset="$(format_reset_epoch "$week_reset_epoch")"
-    printf "%s reset dry-run; status=%s week_left=%s week_reset=%s reset_left=%s\n" \
-      "$name" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
+    quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
+    printf "%s reset dry-run; status=%s quota=%s quota_left=%s quota_reset=%s reset_left=%s\n" \
+      "$name" "${state:-unknown}" "${quota_kind:--}" "${quota_left:--}" "$quota_reset" "$reset_left"
     return 0
   fi
 
@@ -1317,37 +1380,36 @@ cmd_rest() {
   outcome="$(jq -r '.outcome // empty' <<<"$result_json" 2>/dev/null || true)"
   [[ -n "$outcome" ]] || die "reset failed for '$name': no consume response"
 
-  IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$result_json")
+  IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$result_json")
   reset_left="${reset_left:--}"
-  five_reset="$(format_reset_epoch "$five_reset_epoch")"
-  week_reset="$(format_reset_epoch "$week_reset_epoch")"
+  quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
   rate_limit_error="$(jq -r '.rateLimitError // empty' <<<"$result_json" 2>/dev/null || true)"
   if [[ "$outcome" == "reset" || "$outcome" == "alreadyRedeemed" ]]; then
-    record_reset_metadata "$name" "$outcome" "$five_reset_epoch" "$week_reset_epoch"
+    record_reset_metadata "$name" "$outcome" "$five_reset_epoch" "$quota_kind" "$quota_duration" "$quota_reset_epoch"
   fi
 
   case "$outcome" in
     reset)
-      printf "%s reset credit consumed; status=%s week_left=%s week_reset=%s reset_left=%s\n" \
-        "$name" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
+      printf "%s reset credit consumed; status=%s quota=%s quota_left=%s quota_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${quota_kind:--}" "${quota_left:--}" "$quota_reset" "$reset_left"
       ;;
     alreadyRedeemed)
-      printf "%s reset already redeemed for this idempotency key; status=%s week_left=%s week_reset=%s reset_left=%s\n" \
-        "$name" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
+      printf "%s reset already redeemed for this idempotency key; status=%s quota=%s quota_left=%s quota_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${quota_kind:--}" "${quota_left:--}" "$quota_reset" "$reset_left"
       ;;
     nothingToReset)
-      printf "%s reset not used; outcome=nothingToReset status=%s week_left=%s week_reset=%s reset_left=%s\n" \
-        "$name" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
+      printf "%s reset not used; outcome=nothingToReset status=%s quota=%s quota_left=%s quota_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${quota_kind:--}" "${quota_left:--}" "$quota_reset" "$reset_left"
       status=1
       ;;
     noCredit)
-      printf "%s reset not used; outcome=noCredit status=%s week_left=%s week_reset=%s reset_left=%s\n" \
-        "$name" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
+      printf "%s reset not used; outcome=noCredit status=%s quota=%s quota_left=%s quota_reset=%s reset_left=%s\n" \
+        "$name" "${state:-unknown}" "${quota_kind:--}" "${quota_left:--}" "$quota_reset" "$reset_left"
       status=1
       ;;
     *)
-      printf "%s reset finished with unknown outcome=%s; status=%s week_left=%s week_reset=%s reset_left=%s\n" \
-        "$name" "$outcome" "${state:-unknown}" "${week_left:--}" "$week_reset" "$reset_left"
+      printf "%s reset finished with unknown outcome=%s; status=%s quota=%s quota_left=%s quota_reset=%s reset_left=%s\n" \
+        "$name" "$outcome" "${state:-unknown}" "${quota_kind:--}" "${quota_left:--}" "$quota_reset" "$reset_left"
       status=1
       ;;
   esac
@@ -1411,34 +1473,37 @@ verify_touched_account() {
   local model="$6"
   local effort="$7"
   local touch_chars="$8"
-  local attempt status_json layout plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note five_reset week_reset anchored_epoch
+  local attempt status_json layout plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note five_reset quota_reset anchored_epoch
 
   state="unavail"
   five_left="-"
   five_reset_epoch="-"
-  week_left="-"
-  week_reset_epoch="-"
+  quota_kind="-"
+  quota_duration="-"
+  quota_left="-"
+  quota_reset_epoch="-"
 
   status_json="$(query_account_status "$auth")"
   if [[ "$name" == "$current" && -s "$auth" ]]; then
     install_auth "$auth"
   fi
   layout="$(rate_limit_layout "$status_json")"
-  IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+  IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
   state="${state:-unavail}"
   five_left="${five_left:--}"
   five_reset_epoch="${five_reset_epoch:--}"
-  week_left="${week_left:--}"
-  week_reset_epoch="${week_reset_epoch:--}"
+  quota_kind="${quota_kind:--}"
+  quota_duration="${quota_duration:--}"
+  quota_left="${quota_left:--}"
+  quota_reset_epoch="${quota_reset_epoch:--}"
 
-  if [[ "$layout" == "weekly-only" ]]; then
+  if [[ "$layout" == "weekly-only" || "$layout" == "monthly-only" ]]; then
     (( retries >= 4 )) || retries=4
-    if anchored_epoch="$(observe_week_anchor "$name" "$auth" "$current" "$week_reset_epoch" "$retries" "$delay_s")"; then
-      week_reset_epoch="$anchored_epoch"
-      five_reset="$(format_reset_epoch "$five_reset_epoch")"
-      week_reset="$(format_reset_epoch "$week_reset_epoch")"
-      printf '%s touch verified; model=%s effort=%s chars=%s status=week-anchored week_left=%s week_reset=%s\n' \
-        "$name" "$model" "$effort" "$touch_chars" "$week_left" "$week_reset"
+    if anchored_epoch="$(observe_quota_anchor "$name" "$auth" "$current" "$quota_duration" "$quota_reset_epoch" "$retries" "$delay_s")"; then
+      quota_reset_epoch="$anchored_epoch"
+      quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
+      printf '%s touch verified; model=%s effort=%s chars=%s status=%s-anchored quota_left=%s quota_reset=%s\n' \
+        "$name" "$model" "$effort" "$touch_chars" "$quota_kind" "$quota_left" "$quota_reset"
       return 0
     fi
   else
@@ -1449,42 +1514,44 @@ verify_touched_account() {
       if [[ "$name" == "$current" && -s "$auth" ]]; then
         install_auth "$auth"
       fi
-      IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+      IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
       state="${state:-unavail}"
       five_left="${five_left:--}"
       five_reset_epoch="${five_reset_epoch:--}"
-      week_left="${week_left:--}"
-      week_reset_epoch="${week_reset_epoch:--}"
+      quota_kind="${quota_kind:--}"
+      quota_duration="${quota_duration:--}"
+      quota_left="${quota_left:--}"
+      quota_reset_epoch="${quota_reset_epoch:--}"
     done
   fi
 
   if [[ "$state" == "probe" ]]; then
     five_left="~100%"
     five_reset_epoch="-"
-    week_left="~100%"
-    week_reset_epoch="-"
+    quota_left="~100%"
+    quota_reset_epoch="-"
   elif [[ "$state" == "probe5h" ]]; then
     five_left="~100%"
     five_reset_epoch="-"
-  elif [[ "$state" == "probeweek" ]]; then
-    week_left="~100%"
-    week_reset_epoch="-"
+  elif [[ "$state" == "probeweek" || "$state" == "probemonth" ]]; then
+    quota_left="~100%"
+    quota_reset_epoch="-"
   fi
   five_reset="$(format_reset_epoch "$five_reset_epoch")"
-  week_reset="$(format_reset_epoch "$week_reset_epoch")"
+  quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
 
   if stable_limit_state "$state"; then
-    if [[ "$week_reset_epoch" =~ ^[0-9]+$ ]]; then
-      record_week_anchor "$name" "$week_reset_epoch" || true
+    if [[ "$quota_duration" =~ ^[0-9]+$ && "$quota_reset_epoch" =~ ^[0-9]+$ ]]; then
+      record_quota_anchor "$name" "$quota_duration" "$quota_reset_epoch" || true
     fi
-    printf '%s touch verified; model=%s effort=%s chars=%s status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s\n' \
-      "$name" "$model" "$effort" "$touch_chars" "$state" "$five_left" "$five_reset" "$week_left" "$week_reset"
+    printf '%s touch verified; model=%s effort=%s chars=%s status=%s 5h_left=%s 5h_reset=%s quota=%s quota_left=%s quota_reset=%s\n' \
+      "$name" "$model" "$effort" "$touch_chars" "$state" "$five_left" "$five_reset" "$quota_kind" "$quota_left" "$quota_reset"
     return 0
   fi
 
-  printf '%s touch unverified; model=%s effort=%s chars=%s status=%s 5h_left=%s 5h_reset=%s week_left=%s week_reset=%s\n' \
-    "$name" "$model" "$effort" "$touch_chars" "$state" "$five_left" "$five_reset" "$week_left" "$week_reset"
-  if [[ "$state" == "probe" || "$state" == "probe5h" || "$state" == "probeweek" ]]; then
+  printf '%s touch unverified; model=%s effort=%s chars=%s status=%s 5h_left=%s 5h_reset=%s quota=%s quota_left=%s quota_reset=%s\n' \
+    "$name" "$model" "$effort" "$touch_chars" "$state" "$five_left" "$five_reset" "$quota_kind" "$quota_left" "$quota_reset"
+  if [[ "$state" == "probe" || "$state" == "probe5h" || "$state" == "probeweek" || "$state" == "probemonth" ]]; then
     return 2
   fi
   return 1
@@ -1500,52 +1567,54 @@ touch_saved_account() {
   local until_stable="${7:-0}"
   local max_attempts="${8:-0}"
   local auth reset_epoch model effort attempt verify_status window_label="5h"
-  local status_json layout plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note week_reset anchored_epoch preflight_samples
+  local status_json layout plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note quota_reset anchored_epoch preflight_samples
 
   auth="$(account_auth "$name")"
   model="$(touch_model)"
   effort="$(touch_effort)"
   attempt=1
 
-  # Detect the live layout before spending tokens. Weekly-only accounts are
+  # Detect the live layout before spending tokens. Long-window-only accounts are
   # touched only when their reset epoch is still moving; verified anchors are
-  # persisted so later list/change calls can distinguish them from now+7d probes.
+  # persisted so later list/change calls can distinguish fixed resets from probes.
   debug_log "$name touch=preflight"
   status_json="$(query_account_status "$auth")"
   if [[ "$name" == "$current" && -s "$auth" ]]; then
     install_auth "$auth"
   fi
   layout="$(rate_limit_layout "$status_json")"
-  if [[ "$layout" == "weekly-only" ]]; then
-    window_label="weekly"
-    IFS=$'\t' read -r plan state five_left five_reset_epoch week_left week_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
-    week_left="${week_left:--}"
-    week_reset_epoch="${week_reset_epoch:--}"
+  if [[ "$layout" == "weekly-only" || "$layout" == "monthly-only" ]]; then
+    IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+    quota_kind="${quota_kind:--}"
+    quota_duration="${quota_duration:--}"
+    quota_left="${quota_left:--}"
+    quota_reset_epoch="${quota_reset_epoch:--}"
+    window_label="$quota_kind"
     if stable_limit_state "$state"; then
-      if [[ "$week_reset_epoch" =~ ^[0-9]+$ ]]; then
-        record_week_anchor "$name" "$week_reset_epoch" || true
+      if [[ "$quota_duration" =~ ^[0-9]+$ && "$quota_reset_epoch" =~ ^[0-9]+$ ]]; then
+        record_quota_anchor "$name" "$quota_duration" "$quota_reset_epoch" || true
       fi
-      week_reset="$(format_reset_epoch "$week_reset_epoch")"
-      printf '%s touch already anchored; status=%s week_left=%s week_reset=%s\n' \
-        "$name" "${state:-unknown}" "$week_left" "$week_reset"
+      quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
+      printf '%s touch already anchored; status=%s quota=%s quota_left=%s quota_reset=%s\n' \
+        "$name" "${state:-unknown}" "$quota_kind" "$quota_left" "$quota_reset"
       return 0
     fi
-    if week_anchor_matches "$name" "$week_reset_epoch"; then
-      week_reset="$(format_reset_epoch "$week_reset_epoch")"
-      printf '%s touch already anchored; status=week-anchored week_left=%s week_reset=%s\n' \
-        "$name" "$week_left" "$week_reset"
+    if quota_anchor_matches "$name" "$quota_duration" "$quota_reset_epoch"; then
+      quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
+      printf '%s touch already anchored; status=%s-anchored quota_left=%s quota_reset=%s\n' \
+        "$name" "$quota_kind" "$quota_left" "$quota_reset"
       return 0
     fi
     preflight_samples="$verify_retries"
     (( preflight_samples >= 4 )) || preflight_samples=4
-    if anchored_epoch="$(observe_week_anchor "$name" "$auth" "$current" "$week_reset_epoch" "$preflight_samples" "$verify_delay")"; then
-      week_reset="$(format_reset_epoch "$anchored_epoch")"
-      printf '%s touch already anchored; status=week-anchored week_left=%s week_reset=%s\n' \
-        "$name" "$week_left" "$week_reset"
+    if anchored_epoch="$(observe_quota_anchor "$name" "$auth" "$current" "$quota_duration" "$quota_reset_epoch" "$preflight_samples" "$verify_delay")"; then
+      quota_reset="$(format_reset_epoch "$anchored_epoch")"
+      printf '%s touch already anchored; status=%s-anchored quota_left=%s quota_reset=%s\n' \
+        "$name" "$quota_kind" "$quota_left" "$quota_reset"
       return 0
     fi
   fi
-  if [[ "$layout" != "weekly-only" && "$layout" != "five-only" && "$layout" != "five-and-week" ]]; then
+  if [[ "$layout" != "weekly-only" && "$layout" != "monthly-only" && "$layout" != "five-only" && "$layout" != "five-and-week" && "$layout" != "five-and-month" ]]; then
     printf '%s touch skipped; no supported rate-limit window was detected (layout=%s)\n' "$name" "$layout" >&2
     return 1
   fi
@@ -1582,9 +1651,9 @@ touch_saved_account() {
       continue
     fi
 
-    if [[ "$layout" == "weekly-only" ]]; then
-      reset_epoch=$(( $(date +%s) + 10080 * 60 ))
-      printf '%s touch request sent; model=%s effort=%s chars=%s target_week_reset_approx=%s\n' "$name" "$model" "$effort" "$touch_chars" "$(format_reset_epoch "$reset_epoch")"
+    if [[ "$layout" == "weekly-only" || "$layout" == "monthly-only" ]]; then
+      reset_epoch=$(( $(date +%s) + quota_duration * 60 ))
+      printf '%s touch request sent; model=%s effort=%s chars=%s target_%s_reset_approx=%s\n' "$name" "$model" "$effort" "$touch_chars" "$quota_kind" "$(format_reset_epoch "$reset_epoch")"
     else
       reset_epoch=$(( $(date +%s) + 300 * 60 ))
       printf '%s touch request sent; model=%s effort=%s chars=%s target_5h_reset_approx=%s\n' "$name" "$model" "$effort" "$touch_chars" "$(format_reset_epoch "$reset_epoch")"
@@ -1885,4 +1954,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

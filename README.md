@@ -70,22 +70,31 @@ $CODEX_HOME/
       touch.json
 ```
 
-`reset.json` stores local reset-credit metadata. `touch.json` stores only the
-verified weekly reset epoch and verification time; it does not contain auth
-tokens or account identifiers.
+`reset.json` stores local reset-credit metadata. `touch.json` stores only a
+verified quota-window duration, reset epoch, and verification time; it does not
+contain auth tokens or account identifiers. Existing weekly-only `touch.json`
+files remain supported.
 
-## Weekly Limit Windows
+## Weekly and Monthly Limit Windows
 
 Current Codex responses can expose a weekly `10080`-minute window as
-`rateLimits.primary` with no secondary window. The utility identifies windows
-by `windowDurationMins` rather than assuming `primary` is always a 5-hour
-window.
+`rateLimits.primary` with no secondary window. Some accounts instead expose a
+monthly window; for example, `43800` minutes is the server's average-month
+duration. The utility recognizes monthly durations from 28 through 31 days and
+identifies all windows by `windowDurationMins` rather than assuming `primary`
+is always a 5-hour window.
+
+`list` reports the long-term window as `quota=week` or `quota=month` with
+generic `quota_left` and `quota_reset` fields. `change` compares the remaining
+percentage of each account's weekly or monthly quota and uses the earlier reset
+time as the tie-breaker.
 
 `touch all` checks every saved account and skips windows whose reset epoch is
-already verified. For an unanchored weekly window, it sends a real Codex
-request and compares repeated live `week_reset` values. Three consecutive
-identical reset epochs are recorded as an anchored window. By default it keeps
-retrying unstable windows; use `--once` or `--max-attempts N` to bound usage.
+already verified. For an unanchored weekly or monthly window, it sends a real
+Codex request and compares repeated live `quota_reset` values. Three
+consecutive identical reset epochs are recorded as an anchored window. By
+default it keeps retrying unstable windows; use `--once` or `--max-attempts N`
+to bound usage.
 
 Account names may contain only letters, digits, dots, underscores, and dashes.
 
@@ -99,7 +108,7 @@ Account names may contain only letters, digits, dots, underscores, and dashes.
   model request.
 - `touch` intentionally sends a real `codex exec` request and can consume model
   usage. Its default strong prompt is 100,000 characters and retries can consume
-  substantial weekly allowance.
+  substantial weekly or monthly allowance.
 - `rest` consumes an official rate-limit reset credit when a reset is eligible.
 - The script uses `flock` around account-state changes to avoid concurrent
   writes.
@@ -108,5 +117,6 @@ Account names may contain only letters, digits, dots, underscores, and dashes.
 
 ```bash
 bash -n bin/codex-account
+tests/test_rate_limits.sh
 rg -n --hidden --no-ignore -i 'access_token|refresh_token|id_token|OPENAI_API_KEY|bearer|password|secret' .
 ```
