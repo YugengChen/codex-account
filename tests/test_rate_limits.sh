@@ -19,6 +19,11 @@ assert_eq() {
   [[ "$actual" == "$expected" ]] || fail "$label: expected '$expected', got '$actual'"
 }
 
+assert_contains() {
+  local haystack="$1" needle="$2" label="$3"
+  [[ "$haystack" == *"$needle"* ]] || fail "$label: missing '$needle'"
+}
+
 now_epoch="$(date +%s)"
 month_probe_reset=$((now_epoch + 43800 * 60))
 month_probe_json="$(jq -cn --argjson reset "$month_probe_reset" '
@@ -71,6 +76,36 @@ assert_eq "month" "$quota_kind" "31-day monthly kind"
 assert_eq "70%" "$quota_left" "31-day monthly quota left"
 assert_eq "five-and-month" "$(rate_limit_layout "$five_month_json")" "5h/month layout"
 
+auth_error_json='{"rateLimits":null,"tokenPlanType":"team","rateLimitError":"401 Unauthorized: authentication token has been invalidated; please try signing in again"}'
+IFS=$'\t' read -r plan state five_left five_reset quota_kind quota_duration quota_left quota_reset reset_left note \
+  < <(format_rate_limit_fields "$auth_error_json")
+assert_eq "team" "$plan" "auth error plan"
+assert_eq "relogin" "$state" "auth error state"
+assert_eq "-" "$five_left" "auth error 5h quota"
+assert_eq "-" "$quota_kind" "auth error quota kind"
+assert_eq "-" "$quota_left" "auth error quota left"
+
+IFS=$'\t' read -r state five_left quota_kind quota_duration quota_left quota_reset note \
+  < <(change_candidate_fields "$auth_error_json")
+assert_eq "relogin" "$state" "auth error change state"
+assert_eq "-1" "$five_left" "auth error numeric 5h quota"
+assert_eq "-" "$quota_kind" "auth error change quota kind"
+assert_eq "-1" "$quota_left" "auth error numeric quota left"
+
+mkdir -p "$(account_dir di)" "$(account_dir google3)"
+printf '%s\n' '{}' >"$(account_auth di)"
+printf '%s\n' '{}' >"$(account_auth google3)"
+query_account_status() {
+  case "$(basename "$(dirname "$1")")" in
+    di) printf '%s\n' "$auth_error_json" ;;
+    google3) printf '%s\n' "$week_json" ;;
+    *) printf '%s\n' '{"rateLimits":null,"tokenPlanType":"unknown","rateLimitError":"unavailable"}' ;;
+  esac
+}
+list_output="$(cmd_list)"
+assert_contains "$list_output" "di(team)" "list keeps failed account visible"
+assert_contains "$list_output" "google3(plus)" "list continues after failed account"
+
 ensure_dirs
 mkdir -p "$(account_dir fixture)"
 record_quota_anchor fixture 43800 1900000000
@@ -82,4 +117,4 @@ fi
 printf '%s\n' '{"verifiedAt":1,"anchoredWeekResetAt":1900000001}' >"$(account_touch_metadata fixture)"
 quota_anchor_matches fixture 10080 1900000001 || fail "legacy weekly anchor did not match"
 
-printf 'PASS: weekly/monthly rate-limit parsing and anchor compatibility\n'
+printf 'PASS: rate-limit parsing, error isolation, and anchor compatibility\n'

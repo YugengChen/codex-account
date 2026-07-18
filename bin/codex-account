@@ -884,19 +884,20 @@ format_rate_limit_fields() {
     def windows:
       [.rateLimits.primary, .rateLimits.secondary] | map(select(. != null));
     def duration_mins:
-      (.windowDurationMins // null | tonumber?);
+      (.windowDurationMins // null) as $duration |
+      if $duration == null then null else (try ($duration | tonumber) catch null) end;
     def is_month_duration($duration):
       ($duration != null and $duration >= 40320 and $duration <= 44640);
     def five_window:
-      ([windows[] | select(duration_mins == 300)] | first) //
+      ([windows[] | select(duration_mins == 300)][0] // null) //
       (if (.rateLimits.primary.windowDurationMins // null) == null
        then .rateLimits.primary else null end);
     def week_window:
-      ([windows[] | select(duration_mins == 10080)] | first) //
+      ([windows[] | select(duration_mins == 10080)][0] // null) //
       (if (.rateLimits.secondary.windowDurationMins // null) == null
        then .rateLimits.secondary else null end);
     def month_window:
-      ([windows[] | select(duration_mins as $duration | is_month_duration($duration))] | first);
+      ([windows[] | select(duration_mins as $duration | is_month_duration($duration))][0] // null);
     def quota_window:
       month_window // week_window;
     def quota_kind($w):
@@ -957,7 +958,8 @@ rate_limit_layout() {
     def windows:
       [.rateLimits.primary, .rateLimits.secondary] | map(select(. != null));
     def duration_mins:
-      (.windowDurationMins // null | tonumber?);
+      (.windowDurationMins // null) as $duration |
+      if $duration == null then null else (try ($duration | tonumber) catch null) end;
     ([windows[] | select(duration_mins == 300)] | length) as $five |
     ([windows[] | select(duration_mins == 10080)] | length) as $week |
     ([windows[] | select(duration_mins as $duration | $duration != null and $duration >= 40320 and $duration <= 44640)] | length) as $month |
@@ -1045,19 +1047,20 @@ change_candidate_fields() {
     def windows:
       [.rateLimits.primary, .rateLimits.secondary] | map(select(. != null));
     def duration_mins:
-      (.windowDurationMins // null | tonumber?);
+      (.windowDurationMins // null) as $duration |
+      if $duration == null then null else (try ($duration | tonumber) catch null) end;
     def is_month_duration($duration):
       ($duration != null and $duration >= 40320 and $duration <= 44640);
     def five_window:
-      ([windows[] | select(duration_mins == 300)] | first) //
+      ([windows[] | select(duration_mins == 300)][0] // null) //
       (if (.rateLimits.primary.windowDurationMins // null) == null
        then .rateLimits.primary else null end);
     def week_window:
-      ([windows[] | select(duration_mins == 10080)] | first) //
+      ([windows[] | select(duration_mins == 10080)][0] // null) //
       (if (.rateLimits.secondary.windowDurationMins // null) == null
        then .rateLimits.secondary else null end);
     def month_window:
-      ([windows[] | select(duration_mins as $duration | is_month_duration($duration))] | first);
+      ([windows[] | select(duration_mins as $duration | is_month_duration($duration))][0] // null);
     def quota_window:
       month_window // week_window;
     def quota_kind($w):
