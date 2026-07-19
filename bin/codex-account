@@ -45,6 +45,8 @@ Notes:
   Saved accounts are stored under ~/.codex/accounts with 700/600 permissions.
   list updates account information by reading live limits only; it never sends a model request.
   list identifies 5h, weekly, and monthly rate-limit windows by windowDurationMins.
+  list retries transient live-limit failures and may show a recent cached value prefixed with ~.
+  The default limit-cache lifetime is 15 minutes; override CODEX_ACCOUNT_LIMIT_CACHE_MAX_AGE in seconds.
   list shows reset_left when rate limit reset credits are returned by Codex.
   list reads reset-credit details from ChatGPT and shows the nearest reset_exp inside reset_left when returned.
   Use --no, --no-touch, or --no-limits for the quick saved-account list without reading limits.
@@ -106,6 +108,10 @@ account_reset_metadata() {
 
 account_touch_metadata() {
   printf '%s/%s/touch.json\n' "$ACCOUNTS_DIR" "$1"
+}
+
+account_limits_cache() {
+  printf '%s/%s/limits.json\n' "$ACCOUNTS_DIR" "$1"
 }
 
 require_auth() {
@@ -537,7 +543,7 @@ query_reset_credits() {
   rm -f "$tmp"
 }
 
-query_account_status() {
+query_account_status_once() {
   local auth_path="$1"
   if ! command -v jq >/dev/null 2>&1; then
     printf '%s\n' '{"error":"jq is required"}'
@@ -548,7 +554,7 @@ query_account_status() {
     return 0
   fi
 
-  local tmp_home limits_response reset_credits_response token_metadata line rpc_in rpc_out rpc_pid deadline
+  local tmp_home limits_response reset_credits_response token_metadata line rpc_in rpc_out rpc_pid deadline initialized=0
   tmp_home="$(mktemp -d "$ACCOUNTS_DIR/.rpc.XXXXXX")" || {
     printf '%s\n' '{"error":"failed to create temporary CODEX_HOME"}'
     return 0
@@ -572,6 +578,7 @@ query_account_status() {
   while (( SECONDS < deadline )); do
     if IFS= read -r -t 1 line <&"${rpc_out}"; then
       if jq -e '(.id? == 1)' >/dev/null 2>&1 <<<"$line"; then
+        initialized=1
         break
       fi
     fi
@@ -602,7 +609,11 @@ query_account_status() {
   fi
   cleanup_tmp_dir "$tmp_home"
 
-  [[ -n "$limits_response" ]] || limits_response='{}'
+  if [[ -z "$limits_response" ]]; then
+    local rpc_error="rate-limit RPC timed out without a response"
+    (( initialized )) || rpc_error="app-server initialization timed out without a response"
+    limits_response="$(jq -cn --arg message "$rpc_error" '{error:{message:$message}}')"
+  fi
   [[ -n "$reset_credits_response" ]] || reset_credits_response='{}'
   [[ -n "$token_metadata" ]] || token_metadata='{}'
 
@@ -621,6 +632,126 @@ query_account_status() {
       resetCreditsError: ($resetCredits.resetCreditsError // null)
     }
   ' 2>/dev/null || printf '%s\n' '{"error":"failed to parse app-server response"}'
+}
+
+status_has_live_limits() {
+  jq -e '(.rateLimits // null) != null' >/dev/null 2>&1 <<<"$1"
+}
+
+status_requires_relogin() {
+  jq -e '
+    (.rateLimitError // .accountError // .error // "") as $error |
+    ($error | type == "string") and
+    ($error | test("401|token_revoked|token_invalidated|invalidated oauth token|authentication token has been invalidated|refresh token|signing in again"; "i"))
+  ' >/dev/null 2>&1 <<<"$1"
+}
+
+status_query_timed_out() {
+  jq -e '
+    (.rateLimitError // .accountError // .error // "") as $error |
+    ($error | type == "string") and ($error | test("timed out without a response"; "i"))
+  ' >/dev/null 2>&1 <<<"$1"
+}
+
+query_account_status() {
+  local auth_path="$1" attempts delay attempt status_json
+  attempts="${CODEX_ACCOUNT_STATUS_ATTEMPTS:-2}"
+  delay="${CODEX_ACCOUNT_STATUS_RETRY_DELAY:-1}"
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=2
+  (( attempts >= 1 )) || attempts=1
+  (( attempts <= 3 )) || attempts=3
+  [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]] || delay=1
+
+  status_json='{"error":"rate-limit query did not return a valid response"}'
+  for (( attempt = 1; attempt <= attempts; attempt++ )); do
+    status_json="$(query_account_status_once "$auth_path")"
+    if ! jq -e . >/dev/null 2>&1 <<<"$status_json"; then
+      status_json='{"error":"rate-limit query did not return valid JSON"}'
+    fi
+    if status_has_live_limits "$status_json" || status_requires_relogin "$status_json" || status_query_timed_out "$status_json"; then
+      break
+    fi
+    if (( attempt < attempts )); then
+      debug_log "$(basename "$(dirname "$auth_path")") limits=retry attempt=$((attempt + 1))"
+      sleep "$delay"
+    fi
+  done
+
+  printf '%s\n' "$status_json"
+}
+
+write_limits_cache() {
+  local name="$1" status_json="$2" file tmp now
+  status_has_live_limits "$status_json" || return 0
+  file="$(account_limits_cache "$name")"
+  tmp="${file}.tmp.$$"
+  now="$(date +%s)"
+
+  jq -c --argjson cached_at "$now" '
+    {
+      cachedAt: $cached_at,
+      status: {
+        rateLimits: .rateLimits,
+        tokenPlanType: (.tokenPlanType // null),
+        subscriptionActiveUntil: (.subscriptionActiveUntil // null),
+        subscriptionLastChecked: (.subscriptionLastChecked // null)
+      }
+    }
+  ' <<<"$status_json" >"$tmp" 2>/dev/null || {
+    rm -f "$tmp"
+    return 0
+  }
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+read_limits_cache() {
+  local name="$1" file max_age now
+  file="$(account_limits_cache "$name")"
+  [[ -s "$file" ]] || return 0
+  max_age="${CODEX_ACCOUNT_LIMIT_CACHE_MAX_AGE:-900}"
+  [[ "$max_age" =~ ^[0-9]+$ ]] || max_age=900
+  (( max_age > 0 )) || return 0
+  now="$(date +%s)"
+
+  jq -c --argjson now "$now" --argjson max_age "$max_age" '
+    select((.cachedAt | type) == "number") |
+    select(($now - .cachedAt) >= 0 and ($now - .cachedAt) <= $max_age) |
+    .status + {
+      _codexAccountSource: "cache",
+      _codexAccountCachedAt: .cachedAt
+    }
+  ' "$file" 2>/dev/null || true
+}
+
+query_account_status_for_list() {
+  local name="$1" auth_path="$2" status_json cached_json
+  status_json="$(query_account_status "$auth_path")"
+
+  if status_has_live_limits "$status_json"; then
+    write_limits_cache "$name" "$status_json"
+    jq -c '. + {_codexAccountSource:"live"}' <<<"$status_json" 2>/dev/null || printf '%s\n' "$status_json"
+    return 0
+  fi
+
+  if status_requires_relogin "$status_json"; then
+    jq -c '. + {_codexAccountSource:"error"}' <<<"$status_json" 2>/dev/null || printf '%s\n' "$status_json"
+    return 0
+  fi
+
+  cached_json="$(read_limits_cache "$name")"
+  if [[ -n "$cached_json" ]]; then
+    jq -c -n --argjson cached "$cached_json" --argjson live "$status_json" '
+      $cached + {
+        rateLimitResetCredits: ($live.rateLimitResetCredits // null),
+        resetCreditsError: ($live.resetCreditsError // null),
+        _codexAccountLiveError: ($live.rateLimitError // $live.accountError // $live.error // "live limits unavailable")
+      }
+    ' 2>/dev/null || printf '%s\n' "$cached_json"
+    return 0
+  fi
+
+  jq -c '. + {_codexAccountSource:"error"}' <<<"$status_json" 2>/dev/null || printf '%s\n' "$status_json"
 }
 
 new_idempotency_key() {
@@ -1127,7 +1258,7 @@ cmd_list() {
   done
 
   lock
-  local current found name auth marker quota_probe_seen=0
+  local current found name auth marker quota_probe_seen=0 cached_names="" relogin_names="" unavailable_names=""
   current="$(get_current)"
   found=0
 
@@ -1141,13 +1272,14 @@ cmd_list() {
     marker=" "
     [[ "$name" == "$current" ]] && marker="*"
     if (( show_limits )); then
-      local status_json display_name plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note quota_reset reset_expiry_epoch reset_exp reset_left_display anchored_quota=0
+      local status_json display_name plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note quota_reset reset_expiry_epoch reset_exp reset_left_display limit_source anchored_quota=0
       debug_log "$name limits=read"
-      status_json="$(query_account_status "$auth")"
+      status_json="$(query_account_status_for_list "$name" "$auth")"
       if [[ "$name" == "$current" && -s "$auth" ]]; then
         install_auth "$auth"
       fi
       IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
+      limit_source="$(jq -r '._codexAccountSource // "live"' <<<"$status_json" 2>/dev/null || printf 'error')"
       reset_left="${reset_left:--}"
       quota_kind="${quota_kind:--}"
       quota_duration="${quota_duration:--}"
@@ -1175,6 +1307,14 @@ cmd_list() {
         fi
       fi
       quota_left="${quota_left:--}"
+      if [[ "$limit_source" == "cache" ]]; then
+        [[ "$quota_left" == "-" ]] || quota_left="~${quota_left}"
+        cached_names="${cached_names:+$cached_names, }$name"
+      elif [[ "$state" == "relogin" ]]; then
+        relogin_names="${relogin_names:+$relogin_names, }$name"
+      elif [[ "$limit_source" == "error" ]]; then
+        unavailable_names="${unavailable_names:+$unavailable_names, }$name"
+      fi
       quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
       reset_expiry_epoch="$(reset_credit_expiry_epoch "$status_json")"
       if [[ -z "$reset_expiry_epoch" || "$reset_expiry_epoch" == "-" || "$reset_expiry_epoch" == "null" ]]; then
@@ -1195,6 +1335,15 @@ cmd_list() {
   (( found )) || echo "No saved accounts. Use: codex-account save <name>"
   if (( quota_probe_seen )); then
     echo "note: some accounts returned an unanchored weekly/monthly window; query-relative reset times are hidden."
+  fi
+  if [[ -n "$cached_names" ]]; then
+    echo "note: ~ marks cached limits (live query unavailable): $cached_names"
+  fi
+  if [[ -n "$relogin_names" ]]; then
+    echo "note: login required: $relogin_names"
+  fi
+  if [[ -n "$unavailable_names" ]]; then
+    echo "note: live limits unavailable and no recent cache: $unavailable_names"
   fi
 }
 

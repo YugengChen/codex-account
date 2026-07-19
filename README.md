@@ -66,14 +66,16 @@ $CODEX_HOME/
     backups/
     account-name/
       auth.json
+      limits.json
       reset.json
       touch.json
 ```
 
-`reset.json` stores local reset-credit metadata. `touch.json` stores only a
-verified quota-window duration, reset epoch, and verification time; it does not
-contain auth tokens or account identifiers. Existing weekly-only `touch.json`
-files remain supported.
+`limits.json` is a short-lived cache of the last successful rate-limit response.
+It contains quota data and a cache timestamp, but no auth tokens or account
+identifiers. `reset.json` stores local reset-credit metadata. `touch.json`
+stores only a verified quota-window duration, reset epoch, and verification
+time. Existing weekly-only `touch.json` files remain supported.
 
 ## Weekly and Monthly Limit Windows
 
@@ -88,6 +90,13 @@ is always a 5-hour window.
 generic `quota_left` and `quota_reset` fields. `change` compares the remaining
 percentage of each account's weekly or monthly quota and uses the earlier reset
 time as the tie-breaker.
+
+Live-limit reads retry transient failures once. If both attempts fail, `list`
+uses a successful result cached within the last 15 minutes and prefixes the
+cached `quota_left` with `~`. It prints a note when cached data is used, when an
+account needs another login, or when neither live nor recent cached data is
+available. Set `CODEX_ACCOUNT_LIMIT_CACHE_MAX_AGE` to change the cache lifetime
+in seconds, or set it to `0` to disable fallback to older results.
 
 `touch all` checks every saved account and skips windows whose reset epoch is
 already verified. For an unanchored weekly or monthly window, it sends a real
