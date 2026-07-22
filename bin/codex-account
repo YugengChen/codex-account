@@ -53,7 +53,9 @@ Notes:
   change reads live limits and chooses the account with the highest quota_left across weekly/monthly accounts.
   If quota_left ties, change chooses the account whose quota_reset is sooner.
   rest consumes one official rate-limit reset credit for one saved account when a reset is eligible.
-  rest uses app-server only; it does not send a model request.
+  rest performs the consume operation through app-server; it does not send a model request.
+  rest consumes at most once, then polls read-only snapshots until the quota change is visible.
+  A pending refresh is not a reason to run rest/reset again; use list later instead.
   Reuse --idempotency-key KEY only when retrying the same reset attempt.
   touch anchors weekly-only or monthly-only limits by sending usage, then verifies that quota_reset stays fixed.
   Accounts with an already verified weekly/monthly window are skipped without sending another model request.
@@ -545,6 +547,7 @@ query_reset_credits() {
 
 query_account_status_once() {
   local auth_path="$1"
+  local include_reset_credits="${2:-1}"
   if ! command -v jq >/dev/null 2>&1; then
     printf '%s\n' '{"error":"jq is required"}'
     return 0
@@ -603,7 +606,11 @@ query_account_status_once() {
   exec {rpc_out}<&- 2>/dev/null || true
 
   token_metadata="$(decode_auth_metadata "$tmp_home/auth.json")"
-  reset_credits_response="$(query_reset_credits "$tmp_home/auth.json")"
+  if [[ "$include_reset_credits" == "1" ]]; then
+    reset_credits_response="$(query_reset_credits "$tmp_home/auth.json")"
+  else
+    reset_credits_response='{}'
+  fi
   if [[ -s "$tmp_home/auth.json" ]]; then
     install -m 600 "$tmp_home/auth.json" "$auth_path"
   fi
@@ -654,7 +661,7 @@ status_query_timed_out() {
 }
 
 query_account_status() {
-  local auth_path="$1" attempts delay attempt status_json
+  local auth_path="$1" include_reset_credits="${2:-1}" attempts delay attempt status_json
   attempts="${CODEX_ACCOUNT_STATUS_ATTEMPTS:-2}"
   delay="${CODEX_ACCOUNT_STATUS_RETRY_DELAY:-1}"
   [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=2
@@ -664,7 +671,7 @@ query_account_status() {
 
   status_json='{"error":"rate-limit query did not return a valid response"}'
   for (( attempt = 1; attempt <= attempts; attempt++ )); do
-    status_json="$(query_account_status_once "$auth_path")"
+    status_json="$(query_account_status_once "$auth_path" "$include_reset_credits")"
     if ! jq -e . >/dev/null 2>&1 <<<"$status_json"; then
       status_json='{"error":"rate-limit query did not return valid JSON"}'
     fi
@@ -765,6 +772,112 @@ new_idempotency_key() {
     return 0
   fi
   printf 'codex-account-%s-%s-%s%s\n' "$name" "$(date +%s)" "$RANDOM" "$RANDOM"
+}
+
+reset_effect_observed() {
+  local before_json="$1"
+  local after_json="$2"
+
+  jq -e -n --argjson before "$before_json" --argjson after "$after_json" '
+    def number_or_null:
+      if . == null then null else (try tonumber catch null) end;
+    def bucket_windows($root):
+      (if (($root.rateLimitsByLimitId // null) | type) == "object"
+          and (($root.rateLimitsByLimitId | length) > 0) then
+         $root.rateLimitsByLimitId
+       elif ($root.rateLimits // null) != null then
+         {legacy: $root.rateLimits}
+       else
+         {}
+       end) as $buckets |
+      [$buckets | to_entries[] as $bucket |
+        ["primary", "secondary"][] as $slot |
+        ($bucket.value[$slot] // null) as $window |
+        select($window != null) |
+        {
+          limitId: ($bucket.value.limitId // $bucket.key),
+          duration: (($window.windowDurationMins // null) | number_or_null),
+          used: (($window.usedPercent // null) | number_or_null),
+          resetsAt: (($window.resetsAt // null) | number_or_null)
+        }
+      ];
+    def visible_quota_window($root):
+      [($root.rateLimits.primary // null), ($root.rateLimits.secondary // null)] |
+      map(select(. != null) | {
+        limitId: ($root.rateLimits.limitId // "legacy"),
+        duration: ((.windowDurationMins // null) | number_or_null),
+        used: ((.usedPercent // null) | number_or_null),
+        resetsAt: ((.resetsAt // null) | number_or_null)
+      }) as $windows |
+      ([$windows[] | select(.duration != null and .duration >= 40320 and .duration <= 44640)][0] //
+       [$windows[] | select(.duration == 10080)][0] // null);
+    def changed($old; $new):
+      ($old.limitId == $new.limitId) and
+      ($old.duration == $new.duration) and
+      (((($old.resetsAt != null) and ($new.resetsAt != null)) and
+        ($new.resetsAt > ($old.resetsAt + 60))) or
+       ((($old.used != null) and ($new.used != null)) and
+        ($new.used < ($old.used - 1))));
+    (visible_quota_window($before)) as $before_quota |
+    (visible_quota_window($after)) as $after_quota |
+    if $before_quota != null then
+      ($after_quota != null and changed($before_quota; $after_quota))
+    else
+      (bucket_windows($before)) as $before_windows |
+      (bucket_windows($after)) as $after_windows |
+      any($after_windows[]; . as $new |
+        any($before_windows[]; . as $old | changed($old; $new)))
+    end
+  ' >/dev/null 2>&1
+}
+
+wait_for_reset_refresh() {
+  local auth_path="$1"
+  local before_json="$2"
+  local initial_json="$3"
+  local attempts delay attempt candidate latest
+
+  attempts="${CODEX_ACCOUNT_RESET_VERIFY_ATTEMPTS:-8}"
+  delay="${CODEX_ACCOUNT_RESET_VERIFY_DELAY:-1}"
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=8
+  (( attempts >= 1 )) || attempts=1
+  (( attempts <= 20 )) || attempts=20
+  [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]] || delay=1
+
+  latest="$initial_json"
+  if status_has_live_limits "$latest" && reset_effect_observed "$before_json" "$latest"; then
+    printf '%s\n' "$latest"
+    return 0
+  fi
+
+  for (( attempt = 1; attempt <= attempts; attempt++ )); do
+    sleep "$delay"
+    candidate="$(query_account_status "$auth_path" 0)"
+    if status_has_live_limits "$candidate"; then
+      latest="$candidate"
+      if reset_effect_observed "$before_json" "$latest"; then
+        printf '%s\n' "$latest"
+        return 0
+      fi
+    fi
+  done
+
+  printf '%s\n' "$latest"
+  return 1
+}
+
+merge_reset_refresh() {
+  local consume_json="$1"
+  local refreshed_json="$2"
+
+  jq -c -n --argjson consume "$consume_json" --argjson refreshed "$refreshed_json" '
+    $refreshed + {
+      outcome: ($consume.outcome // null),
+      rateLimitResetCredits: ($refreshed.rateLimitResetCredits // $consume.rateLimitResetCredits // null),
+      resetError: ($consume.resetError // null),
+      resetCreditsError: ($refreshed.resetCreditsError // $consume.resetCreditsError // null)
+    }
+  ' 2>/dev/null || printf '%s\n' "$consume_json"
 }
 
 consume_reset_credit() {
@@ -1499,15 +1612,16 @@ cmd_rest() {
   lock
   require_account "$name"
 
-  local current auth status_json plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note quota_reset
+  local current auth status_json plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note quota_reset preflight_error
   current="$(get_current)"
   auth="$(account_auth "$name")"
 
+  status_json="$(query_account_status "$auth")"
+  if [[ "$name" == "$current" && -s "$auth" ]]; then
+    install_auth "$auth"
+  fi
+
   if (( dry_run )); then
-    status_json="$(query_account_status "$auth")"
-    if [[ "$name" == "$current" && -s "$auth" ]]; then
-      install_auth "$auth"
-    fi
     IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
     reset_left="${reset_left:--}"
     quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
@@ -1516,9 +1630,14 @@ cmd_rest() {
     return 0
   fi
 
+  if ! status_has_live_limits "$status_json"; then
+    preflight_error="$(jq -r '.rateLimitError // .accountError // .error // "live limits unavailable"' <<<"$status_json" 2>/dev/null || printf 'live limits unavailable')"
+    die "reset not attempted for '$name': cannot read the pre-reset limits: $preflight_error"
+  fi
+
   [[ -n "$idempotency_key" ]] || idempotency_key="$(new_idempotency_key "$name")"
 
-  local result_json reset_error outcome rate_limit_error status=0
+  local result_json refreshed_json reset_error outcome rate_limit_error status=0 reset_confirmed=0
   result_json="$(consume_reset_credit "$auth" "$idempotency_key")"
   if [[ "$name" == "$current" && -s "$auth" ]]; then
     install_auth "$auth"
@@ -1532,18 +1651,41 @@ cmd_rest() {
   outcome="$(jq -r '.outcome // empty' <<<"$result_json" 2>/dev/null || true)"
   [[ -n "$outcome" ]] || die "reset failed for '$name': no consume response"
 
+  if [[ "$outcome" == "reset" ]]; then
+    rm -f "$(account_limits_cache "$name")"
+    if refreshed_json="$(wait_for_reset_refresh "$auth" "$status_json" "$result_json")"; then
+      reset_confirmed=1
+    fi
+    result_json="$(merge_reset_refresh "$result_json" "$refreshed_json")"
+    if [[ "$name" == "$current" && -s "$auth" ]]; then
+      install_auth "$auth"
+    fi
+    if (( reset_confirmed )) && status_has_live_limits "$result_json"; then
+      write_limits_cache "$name" "$result_json"
+    fi
+  fi
+
   IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$result_json")
   reset_left="${reset_left:--}"
   quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
   rate_limit_error="$(jq -r '.rateLimitError // empty' <<<"$result_json" 2>/dev/null || true)"
-  if [[ "$outcome" == "reset" || "$outcome" == "alreadyRedeemed" ]]; then
+  if (( reset_confirmed )) || [[ "$outcome" == "alreadyRedeemed" ]]; then
     record_reset_metadata "$name" "$outcome" "$five_reset_epoch" "$quota_kind" "$quota_duration" "$quota_reset_epoch"
+    if [[ "$quota_duration" =~ ^[0-9]+$ && "$quota_reset_epoch" =~ ^[0-9]+$ ]]; then
+      record_quota_anchor "$name" "$quota_duration" "$quota_reset_epoch" || true
+    fi
   fi
 
   case "$outcome" in
     reset)
-      printf "%s reset credit consumed; status=%s quota=%s quota_left=%s quota_reset=%s reset_left=%s\n" \
-        "$name" "${state:-unknown}" "${quota_kind:--}" "${quota_left:--}" "$quota_reset" "$reset_left"
+      if (( reset_confirmed )); then
+        printf "%s reset confirmed; status=%s quota=%s quota_left=%s quota_reset=%s reset_left=%s\n" \
+          "$name" "${state:-unknown}" "${quota_kind:--}" "${quota_left:--}" "$quota_reset" "$reset_left"
+      else
+        printf "%s reset credit consumed; quota refresh still pending; status=%s quota=%s quota_left=%s quota_reset=%s reset_left=%s\n" \
+          "$name" "${state:-unknown}" "${quota_kind:--}" "${quota_left:--}" "$quota_reset" "$reset_left"
+        printf "note: do not consume another reset credit; run 'codex-account list' later to refresh the delayed backend snapshot.\n" >&2
+      fi
       ;;
     alreadyRedeemed)
       printf "%s reset already redeemed for this idempotency key; status=%s quota=%s quota_left=%s quota_reset=%s reset_left=%s\n" \

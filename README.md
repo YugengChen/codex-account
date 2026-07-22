@@ -105,6 +105,15 @@ consecutive identical reset epochs are recorded as an anchored window. By
 default it keeps retrying unstable windows; use `--once` or `--max-attempts N`
 to bound usage.
 
+`rest`/`reset` reads a pre-reset snapshot, consumes exactly one reset credit,
+and then polls fresh read-only snapshots until the weekly/monthly quota change
+is visible. This handles the backend's delayed rate-limit refresh without ever
+retrying the consume call. Set `CODEX_ACCOUNT_RESET_VERIFY_ATTEMPTS` (default
+`8`) and `CODEX_ACCOUNT_RESET_VERIFY_DELAY` in seconds (default `1`) to tune
+the verification wait. If confirmation times out, the command reports that the
+credit was consumed and tells you to refresh with `list`; do not run `reset`
+again for that attempt.
+
 Account names may contain only letters, digits, dots, underscores, and dashes.
 
 ## Safety Notes

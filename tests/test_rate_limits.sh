@@ -151,4 +151,89 @@ fi
 printf '%s\n' '{"verifiedAt":1,"anchoredWeekResetAt":1900000001}' >"$(account_touch_metadata fixture)"
 quota_anchor_matches fixture 10080 1900000001 || fail "legacy weekly anchor did not match"
 
-printf 'PASS: rate-limit parsing, retries, cache fallback, error isolation, and anchor compatibility\n'
+reset_before_json='{"rateLimits":{"limitId":"codex","planType":"team","primary":{"usedPercent":98,"windowDurationMins":10080,"resetsAt":1900000000},"secondary":null},"rateLimitResetCredits":{"availableCount":3}}'
+reset_stale_json='{"rateLimits":{"limitId":"codex","planType":"team","primary":{"usedPercent":98,"windowDurationMins":10080,"resetsAt":1900000000},"secondary":null},"rateLimitResetCredits":{"availableCount":2}}'
+reset_after_json='{"rateLimits":{"limitId":"codex","planType":"team","primary":{"usedPercent":6,"windowDurationMins":10080,"resetsAt":1900600000},"secondary":null},"rateLimitResetCredits":{"availableCount":2}}'
+
+if reset_effect_observed "$reset_before_json" "$reset_stale_json"; then
+  fail "credit-count decrease incorrectly confirmed a quota reset"
+fi
+reset_effect_observed "$reset_before_json" "$reset_after_json" || fail "changed quota window was not recognized as a reset"
+
+refresh_counter="$TEST_CODEX_HOME/reset-refresh-counter"
+printf '%s\n' 0 >"$refresh_counter"
+(
+  query_account_status() {
+    local count
+    count="$(sed -n '1p' "$refresh_counter")"
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$refresh_counter"
+    if (( count == 1 )); then
+      printf '%s\n' "$reset_stale_json"
+    else
+      printf '%s\n' "$reset_after_json"
+    fi
+  }
+  CODEX_ACCOUNT_RESET_VERIFY_ATTEMPTS=3
+  CODEX_ACCOUNT_RESET_VERIFY_DELAY=0
+  refreshed_json="$(wait_for_reset_refresh /unused/auth.json "$reset_before_json" "$reset_stale_json")" || fail "delayed reset refresh was not confirmed"
+  reset_effect_observed "$reset_before_json" "$refreshed_json" || fail "refresh returned an unchanged quota window"
+)
+assert_eq "2" "$(sed -n '1p' "$refresh_counter")" "reset refresh poll count"
+
+mkdir -p "$(account_dir resetfixture)"
+printf '%s\n' '{}' >"$(account_auth resetfixture)"
+consume_counter="$TEST_CODEX_HOME/reset-consume-counter"
+command_query_counter="$TEST_CODEX_HOME/reset-command-query-counter"
+printf '%s\n' 0 >"$consume_counter"
+printf '%s\n' 0 >"$command_query_counter"
+reset_command_output="$({
+  query_account_status() {
+    local count
+    count="$(sed -n '1p' "$command_query_counter")"
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$command_query_counter"
+    case "$count" in
+      1|2) printf '%s\n' "$reset_before_json" ;;
+      *) printf '%s\n' "$reset_after_json" ;;
+    esac
+  }
+  consume_reset_credit() {
+    local count
+    count="$(sed -n '1p' "$consume_counter")"
+    printf '%s\n' "$((count + 1))" >"$consume_counter"
+    jq -c '. + {outcome:"reset",resetError:null}' <<<"$reset_stale_json"
+  }
+  CODEX_ACCOUNT_RESET_VERIFY_ATTEMPTS=3
+  CODEX_ACCOUNT_RESET_VERIFY_DELAY=0
+  cmd_rest resetfixture
+})"
+assert_eq "1" "$(sed -n '1p' "$consume_counter")" "reset consume count"
+assert_contains "$reset_command_output" "reset confirmed" "reset command confirmation"
+assert_contains "$reset_command_output" "quota_left=94%" "reset command refreshed quota"
+assert_eq "1900600000" "$(jq -r '.lastResetQuotaExpiresAt' "$(account_reset_metadata resetfixture)")" "confirmed reset metadata"
+assert_eq "1900600000" "$(jq -r '.anchoredResetAt' "$(account_touch_metadata resetfixture)")" "confirmed reset anchor"
+
+mkdir -p "$(account_dir pendingfixture)"
+printf '%s\n' '{}' >"$(account_auth pendingfixture)"
+pending_consume_counter="$TEST_CODEX_HOME/pending-consume-counter"
+printf '%s\n' 0 >"$pending_consume_counter"
+pending_output="$({
+  query_account_status() {
+    printf '%s\n' "$reset_before_json"
+  }
+  consume_reset_credit() {
+    local count
+    count="$(sed -n '1p' "$pending_consume_counter")"
+    printf '%s\n' "$((count + 1))" >"$pending_consume_counter"
+    jq -c '. + {outcome:"reset",resetError:null}' <<<"$reset_stale_json"
+  }
+  CODEX_ACCOUNT_RESET_VERIFY_ATTEMPTS=2
+  CODEX_ACCOUNT_RESET_VERIFY_DELAY=0
+  cmd_rest pendingfixture
+} 2>&1)"
+assert_eq "1" "$(sed -n '1p' "$pending_consume_counter")" "pending reset consume count"
+assert_contains "$pending_output" "quota refresh still pending" "pending reset status"
+assert_contains "$pending_output" "do not consume another reset credit" "pending reset retry warning"
+
+printf 'PASS: rate-limit parsing, retries, cache fallback, reset verification, error isolation, and anchor compatibility\n'
