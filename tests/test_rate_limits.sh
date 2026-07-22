@@ -140,6 +140,102 @@ if jq -e '.status | has("tokens") or has("auth") or has("account")' "$(account_l
   fail "limits cache contains auth-shaped fields"
 fi
 
+fallback_counter="$TEST_CODEX_HOME/reset-fallback-counter"
+printf '%s\n' 0 >"$fallback_counter"
+(
+  query_reset_credits() {
+    local count
+    count="$(sed -n '1p' "$fallback_counter")"
+    printf '%s\n' "$((count + 1))" >"$fallback_counter"
+    printf '%s\n' '{"rateLimitResetCredits":{"availableCount":3}}'
+  }
+  app_credits='{"result":{"rateLimitResetCredits":{"availableCount":3}}}'
+  missing_credits='{"result":{"rateLimitResetCredits":null}}'
+  assert_eq '{}' "$(query_reset_credits_fallback /unused/auth.json "$app_credits")" "app-server reset credits avoid compatibility query"
+  query_reset_credits_fallback /unused/auth.json "$missing_credits" >/dev/null
+  assert_eq "1" "$(sed -n '1p' "$fallback_counter")" "missing reset credits compatibility query"
+  query_reset_credits_fallback /unused/auth.json "$missing_credits" 0 >/dev/null
+  assert_eq "1" "$(sed -n '1p' "$fallback_counter")" "disabled reset credits compatibility query"
+)
+
+mkdir -p "$(account_dir resetcache)" "$(account_dir expiredresetcache)"
+reset_cache_expiry=$((now_epoch + 86400))
+reset_cache_live_json="$(jq -cn --argjson expiry "$reset_cache_expiry" '
+  {
+    rateLimits: {
+      planType: "team",
+      primary: {usedPercent: 25, windowDurationMins: 10080, resetsAt: 1900000000},
+      secondary: null
+    },
+    rateLimitResetCredits: {
+      availableCount: 3,
+      credits: [{id:"private-credit-id",status:"available",expiresAt:$expiry,title:"private title"}]
+    }
+  }
+')"
+reset_cache_missing_json="$(jq -cn '
+  {
+    rateLimits: {
+      planType: "team",
+      primary: {usedPercent: 26, windowDurationMins: 10080, resetsAt: 1900000000},
+      secondary: null
+    },
+    rateLimitResetCredits: null,
+    resetCreditsError: "HTTP 429"
+  }
+')"
+reset_cache_count_only_json="$(jq -cn '
+  {
+    rateLimits: {
+      planType: "team",
+      primary: {usedPercent: 27, windowDurationMins: 10080, resetsAt: 1900000000},
+      secondary: null
+    },
+    rateLimitResetCredits: {availableCount:3,credits:null}
+  }
+')"
+reset_cache_changed_count_json="$(jq -cn '
+  {
+    rateLimits: {
+      planType: "team",
+      primary: {usedPercent: 28, windowDurationMins: 10080, resetsAt: 1900000000},
+      secondary: null
+    },
+    rateLimitResetCredits: {availableCount:2,credits:null}
+  }
+')"
+
+resolved_reset_live="$(resolve_reset_credits resetcache "$reset_cache_live_json")"
+assert_eq "live" "$(jq -r '._codexAccountResetCreditsSource' <<<"$resolved_reset_live")" "live reset-credit source"
+assert_eq "3" "$(jq -r '.rateLimitResetCredits.availableCount' <<<"$resolved_reset_live")" "live reset-credit count"
+if jq -e 'any(.. | objects; has("id") or has("title") or has("tokens") or has("accountId"))' "$(account_reset_credits_cache resetcache)" >/dev/null 2>&1; then
+  fail "reset-credit cache contains private fields"
+fi
+
+resolved_reset_cached="$(resolve_reset_credits resetcache "$reset_cache_missing_json")"
+assert_eq "cache" "$(jq -r '._codexAccountResetCreditsSource' <<<"$resolved_reset_cached")" "cached reset-credit source"
+assert_eq "3" "$(jq -r '.rateLimitResetCredits.availableCount' <<<"$resolved_reset_cached")" "cached reset-credit count"
+cached_reset_expiry="$(reset_credit_expiry_epoch "$resolved_reset_cached")"
+assert_eq "$reset_cache_expiry" "$cached_reset_expiry" "cached reset-credit expiry"
+assert_contains "$(format_reset_left_display 3 "$(format_reset_epoch "$cached_reset_expiry")" cache)" "~3" "cached reset-credit marker"
+
+reset_cache_before_mixed="$(sed -n '1p' "$(account_reset_credits_cache resetcache)")"
+resolved_reset_mixed="$(resolve_reset_credits resetcache "$reset_cache_count_only_json")"
+assert_eq "live-cached-details" "$(jq -r '._codexAccountResetCreditsSource' <<<"$resolved_reset_mixed")" "cached reset-credit detail source"
+assert_contains "$(format_reset_left_display 3 "$(format_reset_epoch "$reset_cache_expiry")" live-cached-details)" "(~" "cached reset-credit expiry marker"
+assert_eq "$reset_cache_before_mixed" "$(sed -n '1p' "$(account_reset_credits_cache resetcache)")" "cached detail lifetime is not extended"
+
+resolved_reset_changed="$(resolve_reset_credits resetcache "$reset_cache_changed_count_json")"
+assert_eq "live" "$(jq -r '._codexAccountResetCreditsSource' <<<"$resolved_reset_changed")" "changed reset-credit count source"
+assert_eq "-" "$(reset_credit_expiry_epoch "$resolved_reset_changed")" "changed count does not reuse stale expiry"
+
+expired_reset_json="$(jq -cn --argjson expiry "$((now_epoch - 1))" '{rateLimitResetCredits:{availableCount:1,credits:[{status:"available",expiresAt:$expiry}]}}')"
+write_reset_credits_cache expiredresetcache "$expired_reset_json"
+assert_eq "" "$(read_reset_credits_cache expiredresetcache)" "expired reset-credit cache"
+CODEX_ACCOUNT_RESET_CACHE_MAX_AGE=0
+assert_eq "" "$(read_reset_credits_cache resetcache)" "disabled reset-credit cache"
+unset CODEX_ACCOUNT_RESET_CACHE_MAX_AGE
+
 ensure_dirs
 mkdir -p "$(account_dir fixture)"
 record_quota_anchor fixture 43800 1900000000
@@ -236,4 +332,4 @@ assert_eq "1" "$(sed -n '1p' "$pending_consume_counter")" "pending reset consume
 assert_contains "$pending_output" "quota refresh still pending" "pending reset status"
 assert_contains "$pending_output" "do not consume another reset credit" "pending reset retry warning"
 
-printf 'PASS: rate-limit parsing, retries, cache fallback, reset verification, error isolation, and anchor compatibility\n'
+printf 'PASS: rate-limit parsing, quota/reset cache fallback, reset verification, error isolation, and anchor compatibility\n'

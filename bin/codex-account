@@ -49,6 +49,8 @@ Notes:
   The default limit-cache lifetime is 15 minutes; override CODEX_ACCOUNT_LIMIT_CACHE_MAX_AGE in seconds.
   list shows reset_left when rate limit reset credits are returned by Codex.
   list reads reset-credit details from ChatGPT and shows the nearest reset_exp inside reset_left when returned.
+  list reuses recent reset-credit data when that optional response is missing; ~ marks cached fields.
+  The reset-credit cache lasts 1 hour by default; override CODEX_ACCOUNT_RESET_CACHE_MAX_AGE in seconds.
   Use --no, --no-touch, or --no-limits for the quick saved-account list without reading limits.
   change reads live limits and chooses the account with the highest quota_left across weekly/monthly accounts.
   If quota_left ties, change chooses the account whose quota_reset is sooner.
@@ -114,6 +116,10 @@ account_touch_metadata() {
 
 account_limits_cache() {
   printf '%s/%s/limits.json\n' "$ACCOUNTS_DIR" "$1"
+}
+
+account_reset_credits_cache() {
+  printf '%s/%s/reset-credits.json\n' "$ACCOUNTS_DIR" "$1"
 }
 
 require_auth() {
@@ -299,24 +305,17 @@ reset_credit_expiry_epoch() {
   ' <<<"$status_json" 2>/dev/null || printf '%s' "-"
 }
 
-local_reset_expiry_epoch() {
-  local name="$1" file
-  file="$(account_reset_metadata "$name")"
-  if [[ ! -s "$file" ]] || ! command -v jq >/dev/null 2>&1; then
-    printf '%s' "-"
-    return 0
-  fi
-
-  jq -r '
-    .lastResetExpiresAt // .last_reset_expires_at //
-    .lastResetQuotaExpiresAt // .last_reset_quota_expires_at //
-    .lastResetWeekExpiresAt // .last_reset_week_expires_at // "-"
-  ' "$file" 2>/dev/null || printf '%s' "-"
-}
-
 format_reset_left_display() {
   local reset_left="${1:--}"
   local reset_exp="${2:--}"
+  local source="${3:-live}"
+
+  if [[ "$source" == "cache" && "$reset_left" != "-" ]]; then
+    reset_left="~${reset_left}"
+  elif [[ "$source" == "live-cached-details" && "$reset_exp" != "-" ]]; then
+    reset_exp="~${reset_exp}"
+  fi
+
   if [[ -n "$reset_exp" && "$reset_exp" != "-" && "$reset_exp" != "null" && "$reset_left" != "-" ]]; then
     printf '%s (%s)' "$reset_left" "$reset_exp"
   else
@@ -545,6 +544,16 @@ query_reset_credits() {
   rm -f "$tmp"
 }
 
+query_reset_credits_fallback() {
+  local auth_path="$1" limits_response="$2" include_reset_credits="${3:-1}"
+  if [[ "$include_reset_credits" != "1" ]] ||
+     jq -e '(.result.rateLimitResetCredits.availableCount // null) != null' >/dev/null 2>&1 <<<"$limits_response"; then
+    printf '%s\n' '{}'
+  else
+    query_reset_credits "$auth_path"
+  fi
+}
+
 query_account_status_once() {
   local auth_path="$1"
   local include_reset_credits="${2:-1}"
@@ -606,11 +615,7 @@ query_account_status_once() {
   exec {rpc_out}<&- 2>/dev/null || true
 
   token_metadata="$(decode_auth_metadata "$tmp_home/auth.json")"
-  if [[ "$include_reset_credits" == "1" ]]; then
-    reset_credits_response="$(query_reset_credits "$tmp_home/auth.json")"
-  else
-    reset_credits_response='{}'
-  fi
+  reset_credits_response="$(query_reset_credits_fallback "$tmp_home/auth.json" "$limits_response" "$include_reset_credits")"
   if [[ -s "$tmp_home/auth.json" ]]; then
     install -m 600 "$tmp_home/auth.json" "$auth_path"
   fi
@@ -643,6 +648,10 @@ query_account_status_once() {
 
 status_has_live_limits() {
   jq -e '(.rateLimits // null) != null' >/dev/null 2>&1 <<<"$1"
+}
+
+status_has_reset_credits() {
+  jq -e '(.rateLimitResetCredits.availableCount // null) != null' >/dev/null 2>&1 <<<"$1"
 }
 
 status_requires_relogin() {
@@ -731,9 +740,131 @@ read_limits_cache() {
   ' "$file" 2>/dev/null || true
 }
 
+write_reset_credits_cache() {
+  local name="$1" status_json="$2" file tmp now
+  status_has_reset_credits "$status_json" || return 0
+  file="$(account_reset_credits_cache "$name")"
+  tmp="${file}.tmp.$$"
+  now="$(date +%s)"
+
+  jq -ce --argjson cached_at "$now" '
+    select((.rateLimitResetCredits.availableCount | type) == "number") |
+    select(.rateLimitResetCredits.availableCount >= 0) |
+    {
+      cachedAt: $cached_at,
+      rateLimitResetCredits: {
+        availableCount: .rateLimitResetCredits.availableCount,
+        credits: (
+          if (.rateLimitResetCredits.credits // null) == null then null
+          elif (.rateLimitResetCredits.credits | type) == "array" then
+            [.rateLimitResetCredits.credits[]? | {
+              status: (.status // null),
+              expiresAt: (.expiresAt // null)
+            }]
+          else null
+          end
+        )
+      }
+    }
+  ' <<<"$status_json" >"$tmp" 2>/dev/null || {
+    rm -f "$tmp"
+    return 0
+  }
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+read_reset_credits_cache() {
+  local name="$1" file max_age now
+  file="$(account_reset_credits_cache "$name")"
+  [[ -s "$file" ]] || return 0
+  max_age="${CODEX_ACCOUNT_RESET_CACHE_MAX_AGE:-3600}"
+  [[ "$max_age" =~ ^[0-9]+$ ]] || max_age=3600
+  (( max_age > 0 )) || return 0
+  now="$(date +%s)"
+
+  jq -c --argjson now "$now" --argjson max_age "$max_age" '
+    def epoch:
+      if . == null then empty
+      elif type == "number" then
+        (if . > 100000000000 then (. / 1000 | floor) else floor end)
+      elif type == "string" then
+        if test("^[0-9]+(\\.[0-9]+)?$") then
+          (tonumber | if . > 100000000000 then (. / 1000 | floor) else floor end)
+        else
+          (try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch empty)
+        end
+      else empty
+      end;
+    select((.cachedAt | type) == "number") |
+    select(($now - .cachedAt) >= 0 and ($now - .cachedAt) <= $max_age) |
+    ([.rateLimitResetCredits.credits[]? |
+      select((.status // "") == "available") |
+      .expiresAt | epoch]) as $expiries |
+    select(all($expiries[]; . > $now))
+  ' "$file" 2>/dev/null || true
+}
+
+resolve_reset_credits() {
+  local name="$1" status_json="$2" cached_json effective_json
+
+  if status_requires_relogin "$status_json"; then
+    jq -c '. + {_codexAccountResetCreditsSource:"unavailable"}' <<<"$status_json" 2>/dev/null || printf '%s\n' "$status_json"
+    return 0
+  fi
+
+  cached_json="$(read_reset_credits_cache "$name")"
+  if status_has_reset_credits "$status_json"; then
+    effective_json="$(jq -c -n \
+      --argjson live "$status_json" \
+      --argjson cached "${cached_json:-null}" '
+        ($live.rateLimitResetCredits) as $live_credits |
+        ($cached.rateLimitResetCredits // null) as $cached_credits |
+        (($live_credits.credits // null) == null and
+         ($cached_credits.availableCount // null) == $live_credits.availableCount and
+         (($cached_credits.credits // null) | type) == "array" and
+         (($cached_credits.credits // []) | length) > 0) as $reuse_details |
+        $live + {
+          rateLimitResetCredits: (
+            if $reuse_details then
+              $live_credits + {credits: $cached_credits.credits}
+            else
+              $live_credits
+            end
+          ),
+          _codexAccountResetCreditsSource: (
+            if $reuse_details then "live-cached-details" else "live" end
+          ),
+          _codexAccountResetCreditsCachedAt: (
+            if $reuse_details then $cached.cachedAt else null end
+          )
+        }
+      ' 2>/dev/null || printf '%s\n' "$status_json")"
+    if [[ "$(jq -r '._codexAccountResetCreditsSource // "live"' <<<"$effective_json" 2>/dev/null || printf 'live')" == "live" ]]; then
+      write_reset_credits_cache "$name" "$effective_json"
+    fi
+    printf '%s\n' "$effective_json"
+    return 0
+  fi
+
+  if [[ -n "$cached_json" ]]; then
+    jq -c -n --argjson live "$status_json" --argjson cached "$cached_json" '
+      $live + {
+        rateLimitResetCredits: $cached.rateLimitResetCredits,
+        _codexAccountResetCreditsSource: "cache",
+        _codexAccountResetCreditsCachedAt: $cached.cachedAt
+      }
+    ' 2>/dev/null || printf '%s\n' "$status_json"
+    return 0
+  fi
+
+  jq -c '. + {_codexAccountResetCreditsSource:"unavailable"}' <<<"$status_json" 2>/dev/null || printf '%s\n' "$status_json"
+}
+
 query_account_status_for_list() {
   local name="$1" auth_path="$2" status_json cached_json
   status_json="$(query_account_status "$auth_path")"
+  status_json="$(resolve_reset_credits "$name" "$status_json")"
 
   if status_has_live_limits "$status_json"; then
     write_limits_cache "$name" "$status_json"
@@ -752,6 +883,8 @@ query_account_status_for_list() {
       $cached + {
         rateLimitResetCredits: ($live.rateLimitResetCredits // null),
         resetCreditsError: ($live.resetCreditsError // null),
+        _codexAccountResetCreditsSource: ($live._codexAccountResetCreditsSource // "unavailable"),
+        _codexAccountResetCreditsCachedAt: ($live._codexAccountResetCreditsCachedAt // null),
         _codexAccountLiveError: ($live.rateLimitError // $live.accountError // $live.error // "live limits unavailable")
       }
     ' 2>/dev/null || printf '%s\n' "$cached_json"
@@ -880,6 +1013,39 @@ merge_reset_refresh() {
   ' 2>/dev/null || printf '%s\n' "$consume_json"
 }
 
+cache_reset_credits_after_outcome() {
+  local name="$1" outcome="$2" before_json="$3" after_json="$4"
+  local before_count after_count expected_count cache_json
+
+  before_count="$(jq -r '.rateLimitResetCredits.availableCount // empty' <<<"$before_json" 2>/dev/null || true)"
+  after_count="$(jq -r '.rateLimitResetCredits.availableCount // empty' <<<"$after_json" 2>/dev/null || true)"
+
+  case "$outcome" in
+    reset)
+      if [[ "$after_count" =~ ^[0-9]+$ ]] && { [[ ! "$before_count" =~ ^[0-9]+$ ]] || (( after_count < before_count )); }; then
+        write_reset_credits_cache "$name" "$after_json"
+      elif [[ "$before_count" =~ ^[0-9]+$ ]]; then
+        expected_count=$(( before_count > 0 ? before_count - 1 : 0 ))
+        cache_json="$(jq -cn --argjson count "$expected_count" '{rateLimitResetCredits:{availableCount:$count,credits:null}}')"
+        write_reset_credits_cache "$name" "$cache_json"
+      else
+        rm -f "$(account_reset_credits_cache "$name")"
+      fi
+      ;;
+    alreadyRedeemed|nothingToReset)
+      if status_has_reset_credits "$after_json"; then
+        write_reset_credits_cache "$name" "$after_json"
+      elif status_has_reset_credits "$before_json"; then
+        write_reset_credits_cache "$name" "$before_json"
+      fi
+      ;;
+    noCredit)
+      cache_json='{"rateLimitResetCredits":{"availableCount":0,"credits":[]}}'
+      write_reset_credits_cache "$name" "$cache_json"
+      ;;
+  esac
+}
+
 consume_reset_credit() {
   local auth_path="$1"
   local idempotency_key="$2"
@@ -952,7 +1118,7 @@ consume_reset_credit() {
   exec {rpc_out}<&- 2>/dev/null || true
 
   token_metadata="$(decode_auth_metadata "$tmp_home/auth.json")"
-  reset_credits_response="$(query_reset_credits "$tmp_home/auth.json")"
+  reset_credits_response="$(query_reset_credits_fallback "$tmp_home/auth.json" "$limits_response")"
   if [[ -s "$tmp_home/auth.json" ]]; then
     install -m 600 "$tmp_home/auth.json" "$auth_path"
   fi
@@ -1371,7 +1537,7 @@ cmd_list() {
   done
 
   lock
-  local current found name auth marker quota_probe_seen=0 cached_names="" relogin_names="" unavailable_names=""
+  local current found name auth marker quota_probe_seen=0 cached_names="" reset_cached_names="" relogin_names="" unavailable_names=""
   current="$(get_current)"
   found=0
 
@@ -1385,7 +1551,7 @@ cmd_list() {
     marker=" "
     [[ "$name" == "$current" ]] && marker="*"
     if (( show_limits )); then
-      local status_json display_name plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note quota_reset reset_expiry_epoch reset_exp reset_left_display limit_source anchored_quota=0
+      local status_json display_name plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note quota_reset reset_expiry_epoch reset_exp reset_left_display limit_source reset_source anchored_quota=0
       debug_log "$name limits=read"
       status_json="$(query_account_status_for_list "$name" "$auth")"
       if [[ "$name" == "$current" && -s "$auth" ]]; then
@@ -1393,6 +1559,7 @@ cmd_list() {
       fi
       IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
       limit_source="$(jq -r '._codexAccountSource // "live"' <<<"$status_json" 2>/dev/null || printf 'error')"
+      reset_source="$(jq -r '._codexAccountResetCreditsSource // "unavailable"' <<<"$status_json" 2>/dev/null || printf 'unavailable')"
       reset_left="${reset_left:--}"
       quota_kind="${quota_kind:--}"
       quota_duration="${quota_duration:--}"
@@ -1428,13 +1595,13 @@ cmd_list() {
       elif [[ "$limit_source" == "error" ]]; then
         unavailable_names="${unavailable_names:+$unavailable_names, }$name"
       fi
+      if [[ "$reset_source" == "cache" || "$reset_source" == "live-cached-details" ]]; then
+        reset_cached_names="${reset_cached_names:+$reset_cached_names, }$name"
+      fi
       quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
       reset_expiry_epoch="$(reset_credit_expiry_epoch "$status_json")"
-      if [[ -z "$reset_expiry_epoch" || "$reset_expiry_epoch" == "-" || "$reset_expiry_epoch" == "null" ]]; then
-        reset_expiry_epoch="$(local_reset_expiry_epoch "$name")"
-      fi
       reset_exp="$(format_reset_epoch "$reset_expiry_epoch")"
-      reset_left_display="$(format_reset_left_display "$reset_left" "$reset_exp")"
+      reset_left_display="$(format_reset_left_display "$reset_left" "$reset_exp" "$reset_source")"
       display_name="$(account_display_name "$name" "$status_json")"
       printf '%s %-24s %-7s %-10s %-11s %-18s\n' "$marker" "$display_name" "$quota_kind" "$quota_left" "$quota_reset" "$reset_left_display"
     else
@@ -1451,6 +1618,9 @@ cmd_list() {
   fi
   if [[ -n "$cached_names" ]]; then
     echo "note: ~ marks cached limits (live query unavailable): $cached_names"
+  fi
+  if [[ -n "$reset_cached_names" ]]; then
+    echo "note: ~ in reset_left marks recent cached reset-credit data: $reset_cached_names"
   fi
   if [[ -n "$relogin_names" ]]; then
     echo "note: login required: $relogin_names"
@@ -1612,11 +1782,12 @@ cmd_rest() {
   lock
   require_account "$name"
 
-  local current auth status_json plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note quota_reset preflight_error
+  local current auth status_json plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note quota_reset reset_source preflight_error
   current="$(get_current)"
   auth="$(account_auth "$name")"
 
   status_json="$(query_account_status "$auth")"
+  status_json="$(resolve_reset_credits "$name" "$status_json")"
   if [[ "$name" == "$current" && -s "$auth" ]]; then
     install_auth "$auth"
   fi
@@ -1624,6 +1795,10 @@ cmd_rest() {
   if (( dry_run )); then
     IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$status_json")
     reset_left="${reset_left:--}"
+    reset_source="$(jq -r '._codexAccountResetCreditsSource // "unavailable"' <<<"$status_json" 2>/dev/null || printf 'unavailable')"
+    if [[ "$reset_source" == "cache" && "$reset_left" != "-" ]]; then
+      reset_left="~${reset_left}"
+    fi
     quota_reset="$(format_reset_epoch "$quota_reset_epoch")"
     printf "%s reset dry-run; status=%s quota=%s quota_left=%s quota_reset=%s reset_left=%s\n" \
       "$name" "${state:-unknown}" "${quota_kind:--}" "${quota_left:--}" "$quota_reset" "$reset_left"
@@ -1653,6 +1828,7 @@ cmd_rest() {
 
   if [[ "$outcome" == "reset" ]]; then
     rm -f "$(account_limits_cache "$name")"
+    rm -f "$(account_reset_credits_cache "$name")"
     if refreshed_json="$(wait_for_reset_refresh "$auth" "$status_json" "$result_json")"; then
       reset_confirmed=1
     fi
@@ -1664,6 +1840,9 @@ cmd_rest() {
       write_limits_cache "$name" "$result_json"
     fi
   fi
+
+  cache_reset_credits_after_outcome "$name" "$outcome" "$status_json" "$result_json"
+  result_json="$(resolve_reset_credits "$name" "$result_json")"
 
   IFS=$'\t' read -r plan state five_left five_reset_epoch quota_kind quota_duration quota_left quota_reset_epoch reset_left note < <(format_rate_limit_fields "$result_json")
   reset_left="${reset_left:--}"

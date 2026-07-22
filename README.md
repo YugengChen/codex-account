@@ -67,15 +67,19 @@ $CODEX_HOME/
     account-name/
       auth.json
       limits.json
+      reset-credits.json
       reset.json
       touch.json
 ```
 
 `limits.json` is a short-lived cache of the last successful rate-limit response.
 It contains quota data and a cache timestamp, but no auth tokens or account
-identifiers. `reset.json` stores local reset-credit metadata. `touch.json`
-stores only a verified quota-window duration, reset epoch, and verification
-time. Existing weekly-only `touch.json` files remain supported.
+identifiers. `reset-credits.json` caches only the available reset count, credit
+status, expiry time, and cache timestamp; it contains no credit IDs, profile
+fields, account identifiers, or tokens. `reset.json` stores local reset-credit
+metadata. `touch.json` stores only a verified quota-window duration, reset
+epoch, and verification time. Existing weekly-only `touch.json` files remain
+supported.
 
 ## Weekly and Monthly Limit Windows
 
@@ -97,6 +101,15 @@ cached `quota_left` with `~`. It prints a note when cached data is used, when an
 account needs another login, or when neither live nor recent cached data is
 available. Set `CODEX_ACCOUNT_LIMIT_CACHE_MAX_AGE` to change the cache lifetime
 in seconds, or set it to `0` to disable fallback to older results.
+
+Reset-credit details are optional in the live response and can be temporarily
+unavailable even when quota fields succeed. `list` first uses reset-credit data
+returned by `account/rateLimits/read` and only makes the compatibility request
+when those fields are absent. A successful result is cached for one hour by
+default. When a later read omits the data, `reset_left` uses the recent cache
+and marks cached values with `~`; known expired credits invalidate the cache.
+Set `CODEX_ACCOUNT_RESET_CACHE_MAX_AGE` to change this lifetime, or set it to
+`0` to disable the fallback.
 
 `touch all` checks every saved account and skips windows whose reset epoch is
 already verified. For an unanchored weekly or monthly window, it sends a real
